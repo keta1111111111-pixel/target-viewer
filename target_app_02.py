@@ -5,6 +5,7 @@ TARGET 指数＆展開予測ビューア (Streamlit版)
 Streamlit Community Cloud へのデプロイを想定。
 """
 
+import io
 import re
 import pandas as pd
 import streamlit as st
@@ -45,7 +46,7 @@ CATEGORY_ORDER = ["逃げ", "先行", "先差", "差し", "追込", "不明"]
 
 SINGLE_PAST_RACE_COLS = [
     '前走開催', '前着順', '前脚質', '前走決め手', '前3F順', '前頭数',
-    '前通過1', '前通過2', '前通過3', '前通過4', '前走2着以内頭数', '前走通過順',
+    '前走2着以内頭数', '前走通過順',
 ]
 NUMBERED_PAST_RACE_RE = re.compile(r'^前(\d+)走(.+)$')
 
@@ -458,14 +459,142 @@ def render_horse_detail(row: pd.Series):
     sections = group_previous_race_columns(row.index.tolist())
     if not sections:
         st.info("過去走のデータが見つかりませんでした。")
+    else:
+        for title, items in sections:
+            with st.expander(title, expanded=True):
+                for label, col in items:
+                    val = row.get(col, '-')
+                    if pd.isna(val) or str(val).strip() == '':
+                        val = '-'
+                    st.markdown(f"**{label}**: {val}")
+
+    render_prev_index_section(row)
+
+# ==========================================================
+# Google Drive 連携（前走時点の指数を日次アーカイブから検索して取得）
+# ==========================================================
+PREV_RACE_ID_COL = '前レースID(新)'
+
+# 表示ラベル → Driveの「外部指数」フォルダ直下のサブフォルダ名
+DRIVE_INDEX_FOLDER_NAMES = {
+    'F指数': 'F指数',
+    'S指数': 'S指数',
+    'FU2': 'FU2',
+    '前走2着以内頭数': '前走',
+}
+
+def drive_configured() -> bool:
+    return bool(st.secrets.get("gcp_service_account")) and bool(st.secrets.get("DRIVE_ROOT_FOLDER_ID"))
+
+@st.cache_resource(show_spinner=False)
+def get_drive_service():
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    info = dict(st.secrets["gcp_service_account"])
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive.readonly"],
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def list_drive_children(folder_id: str):
+    """指定フォルダ直下のファイル/フォルダ一覧を返す（サブフォルダは再帰しない）。"""
+    service = get_drive_service()
+    items = []
+    page_token = None
+    while True:
+        res = service.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageToken=page_token,
+            pageSize=1000,
+        ).execute()
+        items.extend(res.get('files', []))
+        page_token = res.get('nextPageToken')
+        if not page_token:
+            break
+    return items
+
+def find_child_folder(parent_id: str, name: str):
+    for child in list_drive_children(parent_id):
+        if child['mimeType'] == 'application/vnd.google-apps.folder' and child['name'] == name:
+            return child['id']
+    return None
+def find_date_file_in_tree(folder_id: str, yyyymmdd: str, depth: int = 0, max_depth: int = 4):
+    """フォルダ以下を探索し、ファイル名に yyyymmdd を含むファイルを探す。
+    年フォルダなど中間階層の名前は問わず、任意の深さの入れ子に対応する。
+    該当年に近いフォルダから優先的に探索し、無駄なAPI呼び出しを減らす。"""
+    children = list_drive_children(folder_id)
+    files = [c for c in children if c['mimeType'] != 'application/vnd.google-apps.folder']
+    match = next((f for f in files if yyyymmdd in f['name']), None)
+    if match:
+        return match
+    if depth >= max_depth:
+        return None
+
+    year = yyyymmdd[:4]
+    subfolders = [c for c in children if c['mimeType'] == 'application/vnd.google-apps.folder']
+    subfolders.sort(key=lambda f: 0 if year in f['name'] else 1)
+    for sf in subfolders:
+        result = find_date_file_in_tree(sf['id'], yyyymmdd, depth + 1, max_depth)
+        if result:
+            return result
+    return None
+
+@st.cache_data(show_spinner=False)
+def download_drive_index_file(file_id: str) -> pd.DataFrame:
+    service = get_drive_service()
+    content = service.files().get_media(fileId=file_id).execute()
+    df = pd.read_csv(io.BytesIO(content), header=None, sep=r'[\t,]', engine='python',
+                      dtype=str, encoding='cp932')
+    df = df.iloc[:, [0, 1]].dropna()
+    df.columns = ['ID', 'value']
+    return df
+
+def lookup_prev_index_value(root_folder_id: str, label: str, prev_race_id: str):
+    """前レースID(新)（日付8桁を含むID）から該当日のDriveアーカイブを探し、
+    その馬・そのレースの指数値を返す。見つからなければ None。"""
+    prev_race_id = str(prev_race_id).strip()
+    if len(prev_race_id) < 8 or not prev_race_id[:8].isdigit():
+        return None
+    yyyymmdd = prev_race_id[:8]
+
+    folder_name = DRIVE_INDEX_FOLDER_NAMES.get(label)
+    if not folder_name:
+        return None
+    top_folder_id = find_child_folder(root_folder_id, folder_name)
+    if not top_folder_id:
+        return None
+
+    target_file = find_date_file_in_tree(top_folder_id, yyyymmdd)
+    if not target_file:
+        return None
+
+    df = download_drive_index_file(target_file['id'])
+    row = df[df['ID'] == prev_race_id]
+    if row.empty:
+        return None
+    return row.iloc[0]['value']
+
+def render_prev_index_section(row: pd.Series):
+    """Google Driveが設定されていれば、前走時点のF指数・S指数・FU2・
+    前走2着以内頭数をアーカイブから検索して表示する。"""
+    if not drive_configured():
         return
-    for title, items in sections:
-        with st.expander(title, expanded=True):
-            for label, col in items:
-                val = row.get(col, '-')
-                if pd.isna(val) or str(val).strip() == '':
-                    val = '-'
-                st.markdown(f"**{label}**: {val}")
+    prev_id = row.get(PREV_RACE_ID_COL)
+    if pd.isna(prev_id) or not str(prev_id).strip():
+        return
+
+    with st.expander("前走時点の指数（Google Drive）", expanded=True):
+        root_id = st.secrets["DRIVE_ROOT_FOLDER_ID"]
+        try:
+            with st.spinner("Google Driveを検索中..."):
+                for label in ['F指数', 'S指数', 'FU2', '前走2着以内頭数']:
+                    val = lookup_prev_index_value(root_id, label, prev_id)
+                    st.markdown(f"**{label}**: {val if val is not None else '見つかりません'}")
+        except Exception as e:
+            st.warning(f"Google Driveからの取得に失敗しました: {e}")
 
 @st.dialog("馬詳細")
 def show_horse_detail_dialog(row: pd.Series):
