@@ -19,6 +19,18 @@ RANK_COLORS = {
     3: ("#66ff66", "#000000"),  # 3位: 緑
 }
 
+# JRA公式の枠番カラー（1〜8枠）
+WAKU_COLORS = {
+    1: ("#ffffff", "#000000"),  # 白
+    2: ("#000000", "#ffffff"),  # 黒
+    3: ("#e2231a", "#ffffff"),  # 赤
+    4: ("#0068b7", "#ffffff"),  # 青
+    5: ("#ffe200", "#000000"),  # 黄
+    6: ("#009944", "#ffffff"),  # 緑
+    7: ("#f39800", "#ffffff"),  # 橙
+    8: ("#e4007f", "#ffffff"),  # 桃
+}
+
 ROW_TAG_COLORS = {
     'recommend': "#E2EFDA",
     'nige': "#FFE6CC",
@@ -87,23 +99,94 @@ def get_race_key(df: pd.DataFrame) -> pd.Series:
     return pd.Series(['__all__'] * len(df), index=df.index)
 
 def build_race_options(df: pd.DataFrame):
-    """サイドバー/画面上部のレース選択に使う (キー, 表示ラベル) のリストを、
-    発走時刻順に並べて返す。レース列が無ければ None。"""
+    """各レースのメタ情報（キー・場所・Ｒ・レース名・発走時刻など）を
+    発走時刻順に並べたリストで返す。レース列が無ければ None。"""
     if not has_race_columns(df) or RACE_KEY_COL not in df.columns:
         return None
 
     rows = []
     for key, g in df.groupby(RACE_KEY_COL, sort=False):
         first = g.iloc[0]
-        venue = first.get('場所', '')
-        rno = first.get('Ｒ', '')
-        rname = first.get('レース名', '')
-        stime = first.get('発走時刻', '')
-        label = f"{stime}　{venue}{rno}R　{rname}".strip()
-        rows.append((str(stime), key, label))
+        rows.append({
+            'key': key,
+            '場所': first.get('場所', ''),
+            'Ｒ': first.get('Ｒ', ''),
+            'レース名': first.get('レース名', ''),
+            '発走時刻': first.get('発走時刻', ''),
+            '芝ダ': first.get('芝ダ', ''),
+            '距離': first.get('距離', ''),
+            '頭数': len(g),
+        })
 
-    rows.sort(key=lambda r: r[0])
-    return [(key, label) for _, key, label in rows]
+    rows.sort(key=lambda r: str(r['発走時刻']))
+    return rows
+def render_race_selector(race_options):
+    """場所ごとにグループ化した「1R」「2R」…ボタンでレースを選ばせ、
+    選択中のレースのメタ情報（dict）を返す。race_options が空/Noneなら None。"""
+    if not race_options:
+        return None
+
+    by_key = {r['key']: r for r in race_options}
+
+    if st.session_state.get('selected_race_key') not in by_key:
+        st.session_state['selected_race_key'] = race_options[0]['key']
+
+    venues = []
+    races_by_venue = {}
+    for r in race_options:
+        venue = r['場所']
+        if venue not in races_by_venue:
+            races_by_venue[venue] = []
+            venues.append(venue)
+        races_by_venue[venue].append(r)
+
+    cols_per_row = 6
+    for venue in venues:
+        st.markdown(
+            f"<div style='border-left:4px solid #2e7d32;padding-left:8px;"
+            f"font-weight:bold;font-size:15px;margin:12px 0 6px;'>{venue}</div>",
+            unsafe_allow_html=True,
+        )
+        races = sorted(races_by_venue[venue], key=lambda r: safe_float(r['Ｒ'], 0) or 0)
+        for start in range(0, len(races), cols_per_row):
+            chunk = races[start:start + cols_per_row]
+            cols = st.columns(cols_per_row)
+            for col, r in zip(cols, chunk):
+                is_selected = r['key'] == st.session_state['selected_race_key']
+                if col.button(
+                    f"{r['Ｒ']}R",
+                    key=f"racebtn_{r['key']}",
+                    type="primary" if is_selected else "secondary",
+                    use_container_width=True,
+                ):
+                    st.session_state['selected_race_key'] = r['key']
+
+    return by_key[st.session_state['selected_race_key']]
+
+def render_race_info(race_meta, df_race: pd.DataFrame):
+    """選択中レースの発走時刻・レース名・距離・頭数などをまとめて表示する。"""
+    if race_meta is None:
+        return
+
+    parts = []
+    if race_meta.get('発走時刻'):
+        parts.append(str(race_meta['発走時刻']))
+    if race_meta.get('場所') or race_meta.get('Ｒ'):
+        parts.append(f"{race_meta.get('場所', '')}{race_meta.get('Ｒ', '')}R")
+    if race_meta.get('レース名'):
+        parts.append(str(race_meta['レース名']))
+    surface = race_meta.get('芝ダ', '') or ''
+    distance = race_meta.get('距離', '') or ''
+    if surface or distance:
+        parts.append(f"{surface}{distance}m".strip())
+    parts.append(f"{len(df_race)}頭")
+
+    st.markdown(
+        "<div style='background:#eef6ee;border:1px solid #cfe8cf;border-radius:8px;"
+        "padding:10px 16px;font-size:17px;font-weight:bold;margin:4px 0 16px;'>"
+        + "　".join(parts) + "</div>",
+        unsafe_allow_html=True,
+    )
 # ==========================================================
 # データ処理ロジック（既存アプリから移植・フレームワーク非依存）
 # ==========================================================
@@ -182,6 +265,7 @@ def calc_position_and_patterns(df: pd.DataFrame) -> pd.DataFrame:
             return "追込"
 
     df['予想展開'] = df.apply(predict_pos, axis=1, race_size=race_size)
+
     def calc_3f_score(row):
         f3 = safe_float(row.get('前3F順', 0))
         total_h = safe_float(row.get('前頭数', 16))
@@ -331,8 +415,21 @@ def style_dataframe(display_df: pd.DataFrame, full_df: pd.DataFrame):
 
         styler = styler.apply(highlight_index, subset=[col])
 
-    return styler
+    if '枠番' in display_df.columns:
+        def highlight_waku(s):
+            styles = []
+            for v in s:
+                wk = safe_float(v)
+                wk = int(wk) if wk is not None else None
+                if wk in WAKU_COLORS:
+                    bg, fg = WAKU_COLORS[wk]
+                    styles.append(f'background-color:{bg}; color:{fg}; font-weight:bold; text-align:center;')
+                else:
+                    styles.append('')
+            return styles
+        styler = styler.apply(highlight_waku, subset=['枠番'])
 
+    return styler
 def render_horse_detail(row: pd.Series):
     st.markdown(f"#### {row.get('馬番', '')}番 {row.get('馬名', '')}")
     sections = group_previous_race_columns(row.index.tolist())
@@ -392,17 +489,28 @@ def render_tenkai_view(df: pd.DataFrame):
                 r = int(rank) if pd.notna(rank) else 99
                 bg_c, fg_c = RANK_COLORS.get(r, ("#111111", "white"))
                 name_short = idx_name.replace("指数", "")[:3]
-                label = f"{name_short} {val}" + (f" ({r}位)" if r <= 3 else "")
+                label = f"{name_short} {val}"
                 badges_html += (
                     f"<span style='background:{bg_c};color:{fg_c};border:1px solid #444;"
                     f"border-radius:3px;padding:2px 5px;font-size:11px;margin-right:2px;'>{label}</span>"
                 )
 
+            waku_val = safe_float(row.get('枠番'))
+            waku_val = int(waku_val) if waku_val is not None else None
+            if waku_val in WAKU_COLORS:
+                wbg, wfg = WAKU_COLORS[waku_val]
+                waku_badge = (
+                    f"<span style='background:{wbg};color:{wfg};border:1px solid #444;"
+                    f"border-radius:3px;padding:1px 5px;font-size:11px;margin-right:4px;'>{waku_val}</span>"
+                )
+            else:
+                waku_badge = ""
+
             cards_html += (
                 "<div style='background:#2a1a1a;border:1px solid #555;border-radius:4px;"
                 "min-width:160px;max-width:200px;'>"
                 f"<div style='background:{cat_color};color:white;font-weight:bold;"
-                f"font-size:12px;padding:3px 6px;'>{row.get('馬番', '')} {row.get('馬名', '')}</div>"
+                f"font-size:12px;padding:3px 6px;'>{waku_badge}{row.get('馬番', '')} {row.get('馬名', '')}</div>"
                 f"<div style='color:lightgray;font-size:11px;padding:3px 6px;'>前走: {pass_str}</div>"
                 f"<div style='padding:3px 6px 6px;'>{badges_html}</div>"
                 "</div>"
@@ -453,29 +561,24 @@ def main():
 
     # ---- レース選択 ----
     race_options = build_race_options(df)
-    if race_options:
-        keys = [k for k, _ in race_options]
-        labels = [label for _, label in race_options]
-        selected_idx = st.selectbox(
-            "🏇 表示するレース", options=range(len(labels)),
-            format_func=lambda i: labels[i],
-        )
-        selected_key = keys[selected_idx]
-        df_race = df[df[RACE_KEY_COL] == selected_key].reset_index(drop=True)
-        st.caption(f"このレース: {len(df_race)}頭")
+    selected_race = render_race_selector(race_options)
+    if selected_race is not None:
+        df_race = df[df[RACE_KEY_COL] == selected_race['key']].reset_index(drop=True)
     else:
         df_race = df
+    render_race_info(selected_race, df_race)
 
     all_cols = [c for c in df_race.columns if not c.endswith('_rank') and c not in ('先行順位', RACE_KEY_COL)]
     default_cols = [c for c in [
-        '馬番', '枠番', '馬名', '騎手', '人気', '単オッズ', '推奨',
-        '予想展開', '先行スコア', '前走通過順', 'F指数', 'S指数', 'FU2',
+        '枠番', '馬番', '馬名', '騎手', '人気', '単オッズ', '推奨',
+        '予想展開', '前走通過順', 'F指数', 'S指数', 'FU2',
     ] if c in all_cols]
 
     tab_table, tab_tenkai = st.tabs(["📋 出馬表", "🗺️ 展開予想図"])
 
     with tab_table:
-        display_columns = st.multiselect("表示する項目", options=all_cols, default=default_cols)
+        with st.popover("⚙️ 表示する項目"):
+            display_columns = st.multiselect("表示する項目", options=all_cols, default=default_cols)
         if not display_columns:
             st.warning("表示する項目を1つ以上選んでください。")
         else:
