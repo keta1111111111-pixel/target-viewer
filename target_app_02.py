@@ -44,10 +44,21 @@ CATEGORY_COLORS = {
 CATEGORY_ORDER = ["逃げ", "先行", "先差", "差し", "追込", "不明"]
 
 SINGLE_PAST_RACE_COLS = [
-    '前走開催', '前着順', '前脚質', '前3F順', '前頭数',
+    '前走開催', '前着順', '前脚質', '前走決め手', '前3F順', '前頭数',
     '前通過1', '前通過2', '前通過3', '前通過4', '前走2着以内頭数', '前走通過順',
 ]
 NUMBERED_PAST_RACE_RE = re.compile(r'^前(\d+)走(.+)$')
+
+# 脚質（走り方）を表す列は、CSVの出力設定によって列名が異なることがあるため、
+# 複数の候補から最初に値が入っているものを使う。
+STYLE_COLS = ['前脚質', '前走決め手']
+
+def first_nonempty(row, cols):
+    for c in cols:
+        v = row.get(c)
+        if pd.notna(v) and str(v).strip() not in ('', 'nan', 'NaN'):
+            return v
+    return None
 
 # レースを一意に識別するための列（出馬表CSVの「場所」「Ｒ」列）
 RACE_KEY_COLS = ['場所', 'Ｒ']
@@ -205,7 +216,7 @@ def calc_position_and_patterns(df: pd.DataFrame) -> pd.DataFrame:
     df['前走通過順'] = df.apply(format_pass, axis=1)
 
     def calc_front_score(row):
-        style = str(row.get('前脚質', '')).strip()
+        style = str(first_nonempty(row, STYLE_COLS) or '').strip()
         if style == 'nan':
             style = ''
         total_h = safe_float(row.get('前頭数', 16), 16.0)
