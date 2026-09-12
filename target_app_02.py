@@ -37,14 +37,21 @@ SINGLE_PAST_RACE_COLS = [
 ]
 NUMBERED_PAST_RACE_RE = re.compile(r'^前(\d+)走(.+)$')
 
+# レースを一意に識別するための列（出馬表CSVの「場所」「Ｒ」列）
+RACE_KEY_COLS = ['場所', 'Ｒ']
+RACE_KEY_COL = '__race_key__'
+
+# JRA場所コード（指数ファイルのID中の場所コードをレース名に変換するために使用）
+VENUE_CODE_MAP = {
+    "01": "札幌", "02": "函館", "03": "福島", "04": "新潟", "05": "東京",
+    "06": "中山", "07": "中京", "08": "京都", "09": "阪神", "10": "小倉",
+}
 
 def safe_float(v, default=None):
     try:
         return float(v)
     except (TypeError, ValueError):
         return default
-
-
 # ==========================================================
 # パスワード保護（Streamlit Cloudのsecretsに APP_PASSWORD を設定した場合のみ有効）
 # ==========================================================
@@ -66,7 +73,37 @@ def check_password() -> bool:
             st.error("パスワードが違います。")
     return False
 
+# ==========================================================
+# レース単位のグルーピング
+# ==========================================================
+def has_race_columns(df: pd.DataFrame) -> bool:
+    return all(c in df.columns for c in RACE_KEY_COLS)
 
+def get_race_key(df: pd.DataFrame) -> pd.Series:
+    """出馬表1行ごとに、どのレースに属するかを表すキーを返す。
+    「場所」「Ｒ」列が無いCSV（旧形式）の場合は全行を1つのレース扱いにする。"""
+    if has_race_columns(df):
+        return df['場所'].astype(str) + '_' + df['Ｒ'].astype(str)
+    return pd.Series(['__all__'] * len(df), index=df.index)
+
+def build_race_options(df: pd.DataFrame):
+    """サイドバー/画面上部のレース選択に使う (キー, 表示ラベル) のリストを、
+    発走時刻順に並べて返す。レース列が無ければ None。"""
+    if not has_race_columns(df) or RACE_KEY_COL not in df.columns:
+        return None
+
+    rows = []
+    for key, g in df.groupby(RACE_KEY_COL, sort=False):
+        first = g.iloc[0]
+        venue = first.get('場所', '')
+        rno = first.get('Ｒ', '')
+        rname = first.get('レース名', '')
+        stime = first.get('発走時刻', '')
+        label = f"{stime}　{venue}{rno}R　{rname}".strip()
+        rows.append((str(stime), key, label))
+
+    rows.sort(key=lambda r: r[0])
+    return [(key, label) for _, key, label in rows]
 # ==========================================================
 # データ処理ロジック（既存アプリから移植・フレームワーク非依存）
 # ==========================================================
@@ -120,19 +157,19 @@ def calc_position_and_patterns(df: pd.DataFrame) -> pd.DataFrame:
         return round(style_score, 1)
 
     df['先行スコア'] = df.apply(calc_front_score, axis=1)
-    valid_scores = df['先行スコア'][df['先行スコア'] >= 0]
-    if not valid_scores.empty:
-        df['先行順位'] = df['先行スコア'].rank(ascending=False, method='min')
-    else:
-        df['先行順位'] = 99
 
-    total_in_race = len(df)
+    # 先行順位・予想展開は「同じレースの馬同士」で比較しないと意味がないため、
+    # レース（場所＋Ｒ）ごとにグループ化して計算する。
+    df[RACE_KEY_COL] = get_race_key(df)
+    df['先行順位'] = df.groupby(RACE_KEY_COL)['先行スコア'].rank(ascending=False, method='min')
+    race_size = df.groupby(RACE_KEY_COL)[RACE_KEY_COL].transform('size')
 
-    def predict_pos(row):
+    def predict_pos(row, race_size):
         score = row['先行スコア']
         if score < 0:
             return "不明"
         rank = row['先行順位']
+        total_in_race = race_size[row.name]
         if rank == 1:
             return "逃げ"
         elif rank <= max(2, int(total_in_race * 0.25)):
@@ -144,8 +181,7 @@ def calc_position_and_patterns(df: pd.DataFrame) -> pd.DataFrame:
         else:
             return "追込"
 
-    df['予想展開'] = df.apply(predict_pos, axis=1)
-
+    df['予想展開'] = df.apply(predict_pos, axis=1, race_size=race_size)
     def calc_3f_score(row):
         f3 = safe_float(row.get('前3F順', 0))
         total_h = safe_float(row.get('前頭数', 16))
@@ -170,10 +206,8 @@ def calc_position_and_patterns(df: pd.DataFrame) -> pd.DataFrame:
     df['推奨'] = df.apply(check_recommend, axis=1)
     return df
 
-
 def safe_rank(series):
     return pd.to_numeric(series, errors='coerce').rank(ascending=False, method='min')
-
 
 def group_previous_race_columns(columns):
     numbered = {}
@@ -193,8 +227,6 @@ def group_previous_race_columns(columns):
     if single_cols:
         return [("直近走", single_cols)]
     return []
-
-
 # ==========================================================
 # データ読み込み（アップロードファイルから）
 # ==========================================================
@@ -204,26 +236,60 @@ def load_main_csv(file_bytes) -> pd.DataFrame:
     df = calc_position_and_patterns(df)
     return df
 
+def parse_index_id(id_str) -> tuple:
+    """指数ファイルのID（日付8桁＋場所コード2桁＋回2桁＋日2桁＋Ｒ2桁＋馬番2桁の18桁）から
+    (場所名, Ｒ, 馬番) を取り出す。形式が合わない場合はすべて空文字を返す。"""
+    s = str(id_str).strip()
+    if len(s) < 18:
+        return "", "", ""
+
+    venue_code = s[8:10]
+    race_no_raw = s[14:16]
+    horse_no_raw = s[16:18]
+
+    venue_name = VENUE_CODE_MAP.get(venue_code, "")
+    try:
+        race_no = str(int(race_no_raw))
+    except ValueError:
+        race_no = ""
+    try:
+        horse_no = str(int(horse_no_raw))
+    except ValueError:
+        horse_no = ""
+
+    return venue_name, race_no, horse_no
 
 def merge_index_csv(df: pd.DataFrame, idx_name: str, file_bytes) -> pd.DataFrame:
     df_idx = pd.read_csv(file_bytes, header=None, sep=r'[\t,]', engine='python',
                           dtype=str, encoding="cp932")
     df_idx = df_idx.iloc[:, [0, 1]].dropna()
     df_idx.columns = ['ID', idx_name]
-    df_idx['馬番'] = df_idx['ID'].apply(lambda x: str(int(str(x)[-2:])) if len(str(x)) >= 18 else "")
-    df_idx = df_idx[['馬番', idx_name]].drop_duplicates(subset=['馬番'])
+
+    parsed = df_idx['ID'].apply(parse_index_id)
+    df_idx['場所'] = parsed.apply(lambda t: t[0])
+    df_idx['Ｒ'] = parsed.apply(lambda t: t[1])
+    df_idx['馬番'] = parsed.apply(lambda t: t[2])
+
+    # 出馬表側にレース情報（場所・Ｒ）があれば「場所＋Ｒ＋馬番」で紐付ける。
+    # 馬番は1日の中でレースごとに1〜16番が重複するため、馬番だけでの結合は
+    # 複数レースが混在するCSVでは別レースの馬に値を取り違えてしまう。
+    if has_race_columns(df):
+        merge_keys = ['場所', 'Ｒ', '馬番']
+        df_idx = df_idx[df_idx['場所'] != ""]
+    else:
+        merge_keys = ['馬番']
+
+    df_idx = df_idx[df_idx['馬番'] != ""]
+    df_idx = df_idx[merge_keys + [idx_name]].drop_duplicates(subset=merge_keys)
 
     if idx_name in df.columns:
         df = df.drop(columns=[idx_name])
-    return pd.merge(df, df_idx, on='馬番', how='left')
-
-
+    return pd.merge(df, df_idx, on=merge_keys, how='left')
 # ==========================================================
 # 表示（出馬表：スタイル付きデータフレーム＋行タップで詳細）
 # ==========================================================
 def build_display_dataframe(df: pd.DataFrame, display_columns):
     return df[display_columns].reset_index(drop=True)
-
 
 def style_dataframe(display_df: pd.DataFrame, full_df: pd.DataFrame):
     full_reset = full_df.reset_index(drop=True)
@@ -267,7 +333,6 @@ def style_dataframe(display_df: pd.DataFrame, full_df: pd.DataFrame):
 
     return styler
 
-
 def render_horse_detail(row: pd.Series):
     st.markdown(f"#### {row.get('馬番', '')}番 {row.get('馬名', '')}")
     sections = group_previous_race_columns(row.index.tolist())
@@ -281,8 +346,6 @@ def render_horse_detail(row: pd.Series):
                 if pd.isna(val) or str(val).strip() == '':
                     val = '-'
                 st.markdown(f"**{label}**: {val}")
-
-
 # ==========================================================
 # 展開予想図（カード表示・スマホ幅対応）
 # ==========================================================
@@ -346,8 +409,6 @@ def render_tenkai_view(df: pd.DataFrame):
             )
         cards_html += "</div>"
         st.markdown(cards_html, unsafe_allow_html=True)
-
-
 # ==========================================================
 # メイン
 # ==========================================================
@@ -383,9 +444,24 @@ def main():
 
     for idx_col in TARGET_INDICES:
         if idx_col in df.columns:
-            df[f"{idx_col}_rank"] = safe_rank(df[idx_col])
+            df[f"{idx_col}_rank"] = df.groupby(RACE_KEY_COL)[idx_col].transform(safe_rank)
 
-    all_cols = [c for c in df.columns if not c.endswith('_rank') and c != '先行順位']
+    # ---- レース選択 ----
+    race_options = build_race_options(df)
+    if race_options:
+        keys = [k for k, _ in race_options]
+        labels = [label for _, label in race_options]
+        selected_idx = st.selectbox(
+            "🏇 表示するレース", options=range(len(labels)),
+            format_func=lambda i: labels[i],
+        )
+        selected_key = keys[selected_idx]
+        df_race = df[df[RACE_KEY_COL] == selected_key].reset_index(drop=True)
+        st.caption(f"このレース: {len(df_race)}頭")
+    else:
+        df_race = df
+
+    all_cols = [c for c in df_race.columns if not c.endswith('_rank') and c not in ('先行順位', RACE_KEY_COL)]
     default_cols = [c for c in [
         '馬番', '枠番', '馬名', '騎手', '人気', '単オッズ', '推奨',
         '予想展開', '先行スコア', '前走通過順', 'F指数', 'S指数', 'FU2',
@@ -398,8 +474,8 @@ def main():
         if not display_columns:
             st.warning("表示する項目を1つ以上選んでください。")
         else:
-            display_df = build_display_dataframe(df, display_columns)
-            styler = style_dataframe(display_df, df)
+            display_df = build_display_dataframe(df_race, display_columns)
+            styler = style_dataframe(display_df, df_race)
 
             event = st.dataframe(
                 styler,
@@ -413,14 +489,13 @@ def main():
             if selected_rows:
                 st.markdown("---")
                 st.subheader("馬詳細")
-                full_row = df.reset_index(drop=True).iloc[selected_rows[0]]
+                full_row = df_race.reset_index(drop=True).iloc[selected_rows[0]]
                 render_horse_detail(full_row)
             else:
                 st.caption("行をタップすると、その馬の前走詳細が表示されます。")
 
     with tab_tenkai:
-        render_tenkai_view(df)
-
+        render_tenkai_view(df_race)
 
 if __name__ == "__main__":
     main()
