@@ -460,6 +460,9 @@ def style_dataframe(display_df: pd.DataFrame, full_df: pd.DataFrame):
             return styles
         styler = styler.apply(highlight_waku, subset=['枠番'])
 
+    if '単オッズ' in display_df.columns:
+        styler = styler.format({'単オッズ': lambda v: '' if pd.isna(v) else f'{v:.1f}'})
+
     return styler
 
 def render_horse_detail(row: pd.Series):
@@ -880,12 +883,17 @@ def main():
             display_df = build_display_dataframe(df_race, display_columns)
             styler = style_dataframe(display_df, df_race)
 
+            # 行数分の高さを確保し、テーブル内部のスクロールバーが出ないようにする
+            # （ヘッダー約38px＋1行約35px、Streamlitのデータフレーム標準の目安）。
+            table_height = 38 + 35 * len(display_df) + 3
+
             event = st.dataframe(
                 styler,
                 use_container_width=True,
                 hide_index=True,
                 on_select="rerun",
                 selection_mode="single-row",
+                height=table_height,
             )
 
             selected_rows = event.selection.rows if event and event.selection else []
