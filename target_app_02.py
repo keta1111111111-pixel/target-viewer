@@ -5,6 +5,7 @@ TARGET 指数＆展開予測ビューア (Streamlit版)
 Streamlit Community Cloud へのデプロイを想定。
 """
 
+import concurrent.futures
 import io
 import json
 import re
@@ -487,29 +488,40 @@ DRIVE_INDEX_FOLDER_NAMES = {
 def drive_configured() -> bool:
     return bool(st.secrets.get("gcp_service_account")) and bool(st.secrets.get("DRIVE_ROOT_FOLDER_ID"))
 
-@st.cache_resource(show_spinner=False)
-def get_drive_service():
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-
+def _load_service_account_info():
     raw = st.secrets["gcp_service_account"]
     # secrets.toml に [gcp_service_account] の表として書いた場合と、
     # JSONの中身をそのまま文字列として貼った場合の両方に対応する。
     if isinstance(raw, str):
         # private_key 内の改行が「\n」ではなく実際の改行のまま貼られている場合、
         # 通常のJSONパーサはエラーになるため strict=False で許容する。
-        info = json.loads(raw, strict=False)
-    else:
-        info = dict(raw)
-    creds = service_account.Credentials.from_service_account_info(
+        return json.loads(raw, strict=False)
+    return dict(raw)
+
+@st.cache_resource(show_spinner=False)
+def get_service_account_credentials():
+    from google.oauth2 import service_account
+    info = _load_service_account_info()
+    return service_account.Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/drive.readonly"],
     )
+
+def build_drive_service():
+    """呼び出しごとに新しいHTTPトランスポートでDriveサービスを作る。
+    googleapiclient（httplib2）は複数スレッドで同じインスタンスを共有すると
+    問題が起きるため、並列実行するスレッドではそれぞれ新しく作る。"""
+    from googleapiclient.discovery import build
+    creds = get_service_account_credentials()
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
+@st.cache_resource(show_spinner=False)
+def get_drive_service():
+    return build_drive_service()
+
 @st.cache_data(show_spinner=False, ttl=6 * 3600)
-def list_drive_children(folder_id: str):
+def list_drive_children(folder_id: str, _service=None):
     """指定フォルダ直下のファイル/フォルダ一覧を返す（サブフォルダは再帰しない）。"""
-    service = get_drive_service()
+    service = _service or get_drive_service()
     items = []
     page_token = None
     while True:
@@ -525,16 +537,16 @@ def list_drive_children(folder_id: str):
             break
     return items
 
-def find_child_folder(parent_id: str, name: str):
-    for child in list_drive_children(parent_id):
+def find_child_folder(parent_id: str, name: str, service=None):
+    for child in list_drive_children(parent_id, _service=service):
         if child['mimeType'] == 'application/vnd.google-apps.folder' and child['name'] == name:
             return child['id']
     return None
-def find_date_file_in_tree(folder_id: str, yyyymmdd: str, depth: int = 0, max_depth: int = 4):
+def find_date_file_in_tree(folder_id: str, yyyymmdd: str, depth: int = 0, max_depth: int = 4, service=None):
     """フォルダ以下を探索し、ファイル名に yyyymmdd を含むファイルを探す。
     年フォルダなど中間階層の名前は問わず、任意の深さの入れ子に対応する。
     該当年に近いフォルダから優先的に探索し、無駄なAPI呼び出しを減らす。"""
-    children = list_drive_children(folder_id)
+    children = list_drive_children(folder_id, _service=service)
     files = [c for c in children if c['mimeType'] != 'application/vnd.google-apps.folder']
     match = next((f for f in files if yyyymmdd in f['name']), None)
     if match:
@@ -546,14 +558,14 @@ def find_date_file_in_tree(folder_id: str, yyyymmdd: str, depth: int = 0, max_de
     subfolders = [c for c in children if c['mimeType'] == 'application/vnd.google-apps.folder']
     subfolders.sort(key=lambda f: 0 if year in f['name'] else 1)
     for sf in subfolders:
-        result = find_date_file_in_tree(sf['id'], yyyymmdd, depth + 1, max_depth)
+        result = find_date_file_in_tree(sf['id'], yyyymmdd, depth + 1, max_depth, service=service)
         if result:
             return result
     return None
 
 @st.cache_data(show_spinner=False)
-def download_drive_index_file(file_id: str) -> pd.DataFrame:
-    service = get_drive_service()
+def download_drive_index_file(file_id: str, _service=None) -> pd.DataFrame:
+    service = _service or get_drive_service()
     content = service.files().get_media(fileId=file_id).execute()
     df = pd.read_csv(io.BytesIO(content), header=None, sep=r'[\t,]', engine='python',
                       dtype=str, encoding='cp932')
@@ -561,30 +573,60 @@ def download_drive_index_file(file_id: str) -> pd.DataFrame:
     df.columns = ['ID', 'value']
     return df
 
-def lookup_prev_index_value(root_folder_id: str, label: str, prev_race_id: str):
-    """前レースID(新)（日付8桁を含むID）から該当日のDriveアーカイブを探し、
-    その馬・そのレースの指数値を返す。見つからなければ None。"""
-    prev_race_id = str(prev_race_id).strip()
-    if len(prev_race_id) < 8 or not prev_race_id[:8].isdigit():
-        return None
-    yyyymmdd = prev_race_id[:8]
+def lookup_prev_indices_for_ids(root_folder_id: str, prev_race_ids):
+    """複数の前レースID(新)について、F指数・S指数・FU2・前走2着以内頭数を
+    まとめて取得する。{前レースID: {表示ラベル: 値}} を返す。
+    同じ日付のIDは同じアーカイブファイルを共有するため、(ラベル, 日付) の
+    組み合わせ単位でファイルをまとめて並列ダウンロードしてから、
+    それぞれのIDをその場で引く（ファイル取得のAPI呼び出しを最小化する）。"""
+    valid_ids = sorted({
+        str(rid).strip() for rid in prev_race_ids
+        if rid is not None and pd.notna(rid) and len(str(rid).strip()) >= 8
+        and str(rid).strip()[:8].isdigit()
+    })
+    if not valid_ids:
+        return {}
 
-    folder_name = DRIVE_INDEX_FOLDER_NAMES.get(label)
-    if not folder_name:
-        return None
-    top_folder_id = find_child_folder(root_folder_id, folder_name)
-    if not top_folder_id:
-        return None
+    dates_needed = sorted({rid[:8] for rid in valid_ids})
+    labels = list(DRIVE_INDEX_FOLDER_NAMES.keys())
+    tasks = [(label, ymd) for label in labels for ymd in dates_needed]
 
-    target_file = find_date_file_in_tree(top_folder_id, yyyymmdd)
-    if not target_file:
-        return None
+    def fetch_one(label, yyyymmdd):
+        thread_service = build_drive_service()
+        folder_name = DRIVE_INDEX_FOLDER_NAMES[label]
+        top_folder_id = find_child_folder(root_folder_id, folder_name, service=thread_service)
+        if not top_folder_id:
+            return (label, yyyymmdd), None
+        target_file = find_date_file_in_tree(top_folder_id, yyyymmdd, service=thread_service)
+        if not target_file:
+            return (label, yyyymmdd), None
+        return (label, yyyymmdd), download_drive_index_file(target_file['id'], _service=thread_service)
 
-    df = download_drive_index_file(target_file['id'])
-    row = df[df['ID'] == prev_race_id]
-    if row.empty:
-        return None
-    return row.iloc[0]['value']
+    file_cache = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(fetch_one, label, ymd) for label, ymd in tasks]
+        for fut in concurrent.futures.as_completed(futures):
+            key, df = fut.result()
+            file_cache[key] = df
+
+    results = {}
+    for rid in valid_ids:
+        ymd = rid[:8]
+        values = {}
+        for label in labels:
+            df = file_cache.get((label, ymd))
+            if df is not None:
+                row = df[df['ID'] == rid]
+                if not row.empty:
+                    values[label] = row.iloc[0]['value']
+        results[rid] = values
+    return results
+
+@st.cache_data(show_spinner=False)
+def cached_prev_indices_for_race(root_folder_id: str, prev_ids_tuple: tuple):
+    """レース単位で前走指数の検索結果をキャッシュする。
+    タブ切り替えや列選択のたびにDriveへ再アクセスしないようにする。"""
+    return lookup_prev_indices_for_ids(root_folder_id, list(prev_ids_tuple))
 
 def render_prev_index_section(row: pd.Series):
     """Google Driveが設定されていれば、前走時点のF指数・S指数・FU2・
@@ -599,9 +641,11 @@ def render_prev_index_section(row: pd.Series):
         root_id = st.secrets["DRIVE_ROOT_FOLDER_ID"]
         try:
             with st.spinner("Google Driveを検索中..."):
-                for label in ['F指数', 'S指数', 'FU2', '前走2着以内頭数']:
-                    val = lookup_prev_index_value(root_id, label, prev_id)
-                    st.markdown(f"**{label}**: {val if val is not None else '見つかりません'}")
+                results = lookup_prev_indices_for_ids(root_id, [prev_id])
+            values = results.get(str(prev_id).strip(), {})
+            for label in ['F指数', 'S指数', 'FU2', '前走2着以内頭数']:
+                val = values.get(label)
+                st.markdown(f"**{label}**: {val if val is not None else '見つかりません'}")
         except Exception as e:
             st.warning(f"Google Driveからの取得に失敗しました: {e}")
 
@@ -612,7 +656,9 @@ def show_horse_detail_dialog(row: pd.Series):
 # ==========================================================
 # 展開予想図（カード表示・スマホ幅対応）
 # ==========================================================
-def render_tenkai_view(df: pd.DataFrame):
+PREV_LABEL_SHORT = {'F指数': 'F', 'S指数': 'S', 'FU2': 'FU2', '前走2着以内頭数': '複'}
+
+def render_tenkai_view(df: pd.DataFrame, prev_index_map=None):
     st.markdown(
         "<p style='color:#aaaaaa;font-size:13px;'>"
         "逃 → 先 → 先差 → 差 → 追　/　同じ段では左（上）ほど前寄り</p>",
@@ -672,6 +718,20 @@ def render_tenkai_view(df: pd.DataFrame):
             else:
                 waku_badge = ""
 
+            prev_html = ""
+            if prev_index_map is not None:
+                prev_id = row.get(PREV_RACE_ID_COL)
+                prev_values = prev_index_map.get(str(prev_id).strip(), {}) if pd.notna(prev_id) else {}
+                if prev_values:
+                    prev_parts = [
+                        f"前{PREV_LABEL_SHORT[label]} {prev_values[label]}"
+                        for label in PREV_LABEL_SHORT if label in prev_values
+                    ]
+                    prev_html = (
+                        "<div style='color:#8fbf8f;font-size:10px;padding:0 6px 6px;'>"
+                        + " ".join(prev_parts) + "</div>"
+                    )
+
             cards_html += (
                 "<div style='background:#2a1a1a;border:1px solid #555;border-radius:4px;"
                 "min-width:160px;max-width:200px;'>"
@@ -679,6 +739,7 @@ def render_tenkai_view(df: pd.DataFrame):
                 f"font-size:12px;padding:3px 6px;'>{waku_badge}{row.get('馬番', '')} {row.get('馬名', '')}</div>"
                 f"<div style='color:lightgray;font-size:11px;padding:3px 6px;'>前走: {pass_str}</div>"
                 f"<div style='padding:3px 6px 6px;'>{badges_html}</div>"
+                f"{prev_html}"
                 "</div>"
             )
         cards_html += "</div>"
@@ -767,7 +828,23 @@ def main():
                 st.caption("行をクリックすると、その馬の前走詳細がポップアップで表示されます。")
 
     with tab_tenkai:
-        render_tenkai_view(df_race)
+        prev_index_map = None
+        if drive_configured() and PREV_RACE_ID_COL in df_race.columns:
+            show_prev = st.checkbox(
+                "前走時点の指数も表示する（Google Drive・初回は数秒かかります）",
+            )
+            if show_prev:
+                root_id = st.secrets["DRIVE_ROOT_FOLDER_ID"]
+                ids_tuple = tuple(sorted({
+                    str(v).strip() for v in df_race[PREV_RACE_ID_COL]
+                    if pd.notna(v) and str(v).strip()
+                }))
+                try:
+                    with st.spinner("Google Driveから前走指数を取得中..."):
+                        prev_index_map = cached_prev_indices_for_race(root_id, ids_tuple)
+                except Exception as e:
+                    st.warning(f"Google Driveからの取得に失敗しました: {e}")
+        render_tenkai_view(df_race, prev_index_map)
 
 if __name__ == "__main__":
     main()
