@@ -641,8 +641,9 @@ def cached_prev_indices_for_race(root_folder_id: str, prev_ids_tuple: tuple):
     タブ切り替えや列選択のたびにDriveへ再アクセスしないようにする。"""
     return lookup_prev_indices_for_ids(root_folder_id, list(prev_ids_tuple))
 def render_prev_index_section(row: pd.Series):
-    """Google Driveが設定されていれば、前走時点のF指数・S指数・FU2（値と、
-    同じ前走レース内での順位）をアーカイブから検索して表示する。"""
+    """Google Driveが設定されていれば、前走時点のF指数・S指数・FU2を
+    アーカイブから検索して表示する。今走の指数と同じく、同じ前走レース内で
+    1〜3位だった場合のみ色を付ける（4位以下・順位不明時は色なし）。"""
     if not drive_configured():
         return
     prev_id = row.get(PREV_RACE_ID_COL)
@@ -659,8 +660,17 @@ def render_prev_index_section(row: pd.Series):
                 info = values.get(label)
                 if info is None:
                     st.markdown(f"**{label}**: 見つかりません")
+                    continue
+                if info['rank'] in RANK_COLORS:
+                    bg, fg = RANK_COLORS[info['rank']]
+                    st.markdown(
+                        f"**{label}**: <span style='background:{bg};color:{fg};"
+                        f"padding:2px 8px;border-radius:4px;font-weight:bold;'>"
+                        f"{info['value']}</span>",
+                        unsafe_allow_html=True,
+                    )
                 else:
-                    st.markdown(f"**{label}**: {info['value']}（{info['rank']}位/{info['total']}頭）")
+                    st.markdown(f"**{label}**: {info['value']}")
         except Exception as e:
             st.warning(f"Google Driveからの取得に失敗しました: {e}")
 
@@ -738,14 +748,27 @@ def render_tenkai_view(df: pd.DataFrame, prev_index_map=None):
                 prev_id = row.get(PREV_RACE_ID_COL)
                 prev_values = prev_index_map.get(str(prev_id).strip(), {}) if pd.notna(prev_id) else {}
                 if prev_values:
-                    prev_parts = [
-                        f"前{PREV_LABEL_SHORT[label]} {prev_values[label]['value']}"
-                        f"({prev_values[label]['rank']}位)"
-                        for label in PREV_LABEL_SHORT if label in prev_values
-                    ]
+                    prev_badges = []
+                    for label in PREV_LABEL_SHORT:
+                        if label not in prev_values:
+                            continue
+                        info = prev_values[label]
+                        text = f"前{PREV_LABEL_SHORT[label]} {info['value']}"
+                        if info['rank'] in RANK_COLORS:
+                            bg, fg = RANK_COLORS[info['rank']]
+                            prev_badges.append(
+                                f"<span style='background:{bg};color:{fg};border:1px solid #444;"
+                                f"border-radius:3px;padding:2px 5px;font-size:10px;"
+                                f"margin-right:2px;font-weight:bold;'>{text}</span>"
+                            )
+                        else:
+                            prev_badges.append(
+                                "<span style='background:#111;color:#8fbf8f;border:1px solid #444;"
+                                f"border-radius:3px;padding:2px 5px;font-size:10px;"
+                                f"margin-right:2px;'>{text}</span>"
+                            )
                     prev_html = (
-                        "<div style='color:#8fbf8f;font-size:10px;padding:0 6px 6px;'>"
-                        + " ".join(prev_parts) + "</div>"
+                        "<div style='padding:0 6px 6px;'>" + "".join(prev_badges) + "</div>"
                     )
 
             cards_html += (
@@ -838,9 +861,20 @@ def main():
 
             selected_rows = event.selection.rows if event and event.selection else []
             if selected_rows:
-                full_row = df_race.reset_index(drop=True).iloc[selected_rows[0]]
-                show_horse_detail_dialog(full_row)
+                # 展開予想図タブのチェックボックス操作など、この選択と無関係な
+                # 再実行でも出馬表の選択状態は保持され続けるため、そのままだと
+                # 毎回ポップアップが再度開いてしまう。同じ選択に対しては
+                # 一度だけ開くようにする。
+                selection_signature = (
+                    selected_race['key'] if selected_race else None,
+                    tuple(selected_rows),
+                )
+                if st.session_state.get('_last_shown_selection') != selection_signature:
+                    st.session_state['_last_shown_selection'] = selection_signature
+                    full_row = df_race.reset_index(drop=True).iloc[selected_rows[0]]
+                    show_horse_detail_dialog(full_row)
             else:
+                st.session_state['_last_shown_selection'] = None
                 st.caption("行をクリックすると、その馬の前走詳細がポップアップで表示されます。")
 
     with tab_tenkai:
