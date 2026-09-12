@@ -496,7 +496,9 @@ def get_drive_service():
     # secrets.toml に [gcp_service_account] の表として書いた場合と、
     # JSONの中身をそのまま文字列として貼った場合の両方に対応する。
     if isinstance(raw, str):
-        info = json.loads(raw)
+        # private_key 内の改行が「\n」ではなく実際の改行のまま貼られている場合、
+        # 通常のJSONパーサはエラーになるため strict=False で許容する。
+        info = json.loads(raw, strict=False)
     else:
         info = dict(raw)
     creds = service_account.Credentials.from_service_account_info(
