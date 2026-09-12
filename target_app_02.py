@@ -482,7 +482,6 @@ DRIVE_INDEX_FOLDER_NAMES = {
     'F指数': 'F指数',
     'S指数': 'S指数',
     'FU2': 'FU2',
-    '前走2着以内頭数': '前走',
 }
 
 def drive_configured() -> bool:
@@ -574,8 +573,10 @@ def download_drive_index_file(file_id: str, _service=None) -> pd.DataFrame:
     return df
 
 def lookup_prev_indices_for_ids(root_folder_id: str, prev_race_ids):
-    """複数の前レースID(新)について、F指数・S指数・FU2・前走2着以内頭数を
-    まとめて取得する。{前レースID: {表示ラベル: 値}} を返す。
+    """複数の前レースID(新)について、F指数・S指数・FU2をまとめて取得する。
+    {前レースID: {表示ラベル: {'value':値, 'rank':順位, 'total':頭数}}} を返す。
+    順位は「同じ前走レース（IDの先頭16桁が一致する馬たち）」の中での
+    その指数の順位（降順・同値は同順位）。
     同じ日付のIDは同じアーカイブファイルを共有するため、(ラベル, 日付) の
     組み合わせ単位でファイルをまとめて並列ダウンロードしてから、
     それぞれのIDをその場で引く（ファイル取得のAPI呼び出しを最小化する）。"""
@@ -612,13 +613,25 @@ def lookup_prev_indices_for_ids(root_folder_id: str, prev_race_ids):
     results = {}
     for rid in valid_ids:
         ymd = rid[:8]
+        race_prefix = rid[:16]  # 日付+場所+回+日+Ｒ（馬番を除いた「同じレース」の単位）
         values = {}
         for label in labels:
             df = file_cache.get((label, ymd))
-            if df is not None:
-                row = df[df['ID'] == rid]
-                if not row.empty:
-                    values[label] = row.iloc[0]['value']
+            if df is None:
+                continue
+            race_df = df[df['ID'].str[:16] == race_prefix].copy()
+            race_df['value_num'] = pd.to_numeric(race_df['value'], errors='coerce')
+            race_df = race_df.dropna(subset=['value_num'])
+            if race_df.empty:
+                continue
+            race_df['rank'] = race_df['value_num'].rank(ascending=False, method='min')
+            row = race_df[race_df['ID'] == rid]
+            if not row.empty:
+                values[label] = {
+                    'value': row.iloc[0]['value'],
+                    'rank': int(row.iloc[0]['rank']),
+                    'total': len(race_df),
+                }
         results[rid] = values
     return results
 
@@ -627,10 +640,9 @@ def cached_prev_indices_for_race(root_folder_id: str, prev_ids_tuple: tuple):
     """レース単位で前走指数の検索結果をキャッシュする。
     タブ切り替えや列選択のたびにDriveへ再アクセスしないようにする。"""
     return lookup_prev_indices_for_ids(root_folder_id, list(prev_ids_tuple))
-
 def render_prev_index_section(row: pd.Series):
-    """Google Driveが設定されていれば、前走時点のF指数・S指数・FU2・
-    前走2着以内頭数をアーカイブから検索して表示する。"""
+    """Google Driveが設定されていれば、前走時点のF指数・S指数・FU2（値と、
+    同じ前走レース内での順位）をアーカイブから検索して表示する。"""
     if not drive_configured():
         return
     prev_id = row.get(PREV_RACE_ID_COL)
@@ -643,9 +655,12 @@ def render_prev_index_section(row: pd.Series):
             with st.spinner("Google Driveを検索中..."):
                 results = lookup_prev_indices_for_ids(root_id, [prev_id])
             values = results.get(str(prev_id).strip(), {})
-            for label in ['F指数', 'S指数', 'FU2', '前走2着以内頭数']:
-                val = values.get(label)
-                st.markdown(f"**{label}**: {val if val is not None else '見つかりません'}")
+            for label in ['F指数', 'S指数', 'FU2']:
+                info = values.get(label)
+                if info is None:
+                    st.markdown(f"**{label}**: 見つかりません")
+                else:
+                    st.markdown(f"**{label}**: {info['value']}（{info['rank']}位/{info['total']}頭）")
         except Exception as e:
             st.warning(f"Google Driveからの取得に失敗しました: {e}")
 
@@ -656,7 +671,7 @@ def show_horse_detail_dialog(row: pd.Series):
 # ==========================================================
 # 展開予想図（カード表示・スマホ幅対応）
 # ==========================================================
-PREV_LABEL_SHORT = {'F指数': 'F', 'S指数': 'S', 'FU2': 'FU2', '前走2着以内頭数': '複'}
+PREV_LABEL_SHORT = {'F指数': 'F', 'S指数': 'S', 'FU2': 'FU2'}
 
 def render_tenkai_view(df: pd.DataFrame, prev_index_map=None):
     st.markdown(
@@ -724,7 +739,8 @@ def render_tenkai_view(df: pd.DataFrame, prev_index_map=None):
                 prev_values = prev_index_map.get(str(prev_id).strip(), {}) if pd.notna(prev_id) else {}
                 if prev_values:
                     prev_parts = [
-                        f"前{PREV_LABEL_SHORT[label]} {prev_values[label]}"
+                        f"前{PREV_LABEL_SHORT[label]} {prev_values[label]['value']}"
+                        f"({prev_values[label]['rank']}位)"
                         for label in PREV_LABEL_SHORT if label in prev_values
                     ]
                     prev_html = (
