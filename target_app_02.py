@@ -384,7 +384,19 @@ def merge_index_csv(df: pd.DataFrame, idx_name: str, file_bytes) -> pd.DataFrame
 # 表示（出馬表：スタイル付きデータフレーム＋行タップで詳細）
 # ==========================================================
 def build_display_dataframe(df: pd.DataFrame, display_columns):
-    return df[display_columns].reset_index(drop=True)
+    out = df[display_columns].reset_index(drop=True)
+    # CSVはdtype=strで読み込んでいるため、そのままだと表の列見出しクリックでの
+    # 並べ替えが文字列比較になり「10」が「2」より前に来るなど直感に反する結果になる。
+    # 大半の値が数値に変換できる列は、表示用に数値型へ変換しておく。
+    for col in out.columns:
+        converted = pd.to_numeric(out[col], errors='coerce')
+        non_empty = out[col].notna() & (out[col].astype(str).str.strip() != '')
+        if non_empty.sum() > 0 and converted.notna().sum() >= non_empty.sum() * 0.9:
+            if (converted.dropna() % 1 == 0).all():
+                out[col] = converted.astype('Int64')
+            else:
+                out[col] = converted
+    return out
 
 def style_dataframe(display_df: pd.DataFrame, full_df: pd.DataFrame):
     full_reset = full_df.reset_index(drop=True)
@@ -454,6 +466,11 @@ def render_horse_detail(row: pd.Series):
                 if pd.isna(val) or str(val).strip() == '':
                     val = '-'
                 st.markdown(f"**{label}**: {val}")
+
+@st.dialog("馬詳細")
+def show_horse_detail_dialog(row: pd.Series):
+    """出馬表の行をクリックした際に、スクロール不要でその場にポップアップ表示する。"""
+    render_horse_detail(row)
 # ==========================================================
 # 展開予想図（カード表示・スマホ幅対応）
 # ==========================================================
@@ -606,12 +623,10 @@ def main():
 
             selected_rows = event.selection.rows if event and event.selection else []
             if selected_rows:
-                st.markdown("---")
-                st.subheader("馬詳細")
                 full_row = df_race.reset_index(drop=True).iloc[selected_rows[0]]
-                render_horse_detail(full_row)
+                show_horse_detail_dialog(full_row)
             else:
-                st.caption("行をタップすると、その馬の前走詳細が表示されます。")
+                st.caption("行をクリックすると、その馬の前走詳細がポップアップで表示されます。")
 
     with tab_tenkai:
         render_tenkai_view(df_race)
