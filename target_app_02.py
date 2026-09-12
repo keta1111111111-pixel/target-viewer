@@ -6,6 +6,7 @@ Streamlit Community Cloud へのデプロイを想定。
 """
 
 import io
+import json
 import re
 import pandas as pd
 import streamlit as st
@@ -491,7 +492,13 @@ def get_drive_service():
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
 
-    info = dict(st.secrets["gcp_service_account"])
+    raw = st.secrets["gcp_service_account"]
+    # secrets.toml に [gcp_service_account] の表として書いた場合と、
+    # JSONの中身をそのまま文字列として貼った場合の両方に対応する。
+    if isinstance(raw, str):
+        info = json.loads(raw)
+    else:
+        info = dict(raw)
     creds = service_account.Credentials.from_service_account_info(
         info, scopes=["https://www.googleapis.com/auth/drive.readonly"],
     )
