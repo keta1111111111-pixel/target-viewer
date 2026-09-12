@@ -78,6 +78,7 @@ def safe_float(v, default=None):
         return float(v)
     except (TypeError, ValueError):
         return default
+
 # ==========================================================
 # パスワード保護（Streamlit Cloudのsecretsに APP_PASSWORD を設定した場合のみ有効）
 # ==========================================================
@@ -134,6 +135,7 @@ def build_race_options(df: pd.DataFrame):
 
     rows.sort(key=lambda r: str(r['発走時刻']))
     return rows
+
 def render_race_selector(race_options):
     """場所ごとにグループ化した「1R」「2R」…ボタンでレースを選ばせ、
     選択中のレースのメタ情報（dict）を返す。race_options が空/Noneなら None。"""
@@ -201,6 +203,7 @@ def render_race_info(race_meta, df_race: pd.DataFrame):
         + "　".join(parts) + "</div>",
         unsafe_allow_html=True,
     )
+
 # ==========================================================
 # データ処理ロジック（既存アプリから移植・フレームワーク非依存）
 # ==========================================================
@@ -325,6 +328,7 @@ def group_previous_race_columns(columns):
     if single_cols:
         return [("直近走", single_cols)]
     return []
+
 # ==========================================================
 # データ読み込み（アップロードファイルから）
 # ==========================================================
@@ -383,6 +387,7 @@ def merge_index_csv(df: pd.DataFrame, idx_name: str, file_bytes) -> pd.DataFrame
     if idx_name in df.columns:
         df = df.drop(columns=[idx_name])
     return pd.merge(df, df_idx, on=merge_keys, how='left')
+
 # ==========================================================
 # 表示（出馬表：スタイル付きデータフレーム＋行タップで詳細）
 # ==========================================================
@@ -456,6 +461,7 @@ def style_dataframe(display_df: pd.DataFrame, full_df: pd.DataFrame):
         styler = styler.apply(highlight_waku, subset=['枠番'])
 
     return styler
+
 def render_horse_detail(row: pd.Series):
     st.markdown(f"#### {row.get('馬番', '')}番 {row.get('馬名', '')}")
     sections = group_previous_race_columns(row.index.tolist())
@@ -541,6 +547,7 @@ def find_child_folder(parent_id: str, name: str, service=None):
         if child['mimeType'] == 'application/vnd.google-apps.folder' and child['name'] == name:
             return child['id']
     return None
+
 def find_date_file_in_tree(folder_id: str, yyyymmdd: str, depth: int = 0, max_depth: int = 4, service=None):
     """フォルダ以下を探索し、ファイル名に yyyymmdd を含むファイルを探す。
     年フォルダなど中間階層の名前は問わず、任意の深さの入れ子に対応する。
@@ -640,6 +647,7 @@ def cached_prev_indices_for_race(root_folder_id: str, prev_ids_tuple: tuple):
     """レース単位で前走指数の検索結果をキャッシュする。
     タブ切り替えや列選択のたびにDriveへ再アクセスしないようにする。"""
     return lookup_prev_indices_for_ids(root_folder_id, list(prev_ids_tuple))
+
 def render_prev_index_section(row: pd.Series):
     """Google Driveが設定されていれば、前走時点のF指数・S指数・FU2を
     アーカイブから検索して表示する。今走の指数と同じく、同じ前走レース内で
@@ -678,10 +686,13 @@ def render_prev_index_section(row: pd.Series):
 def show_horse_detail_dialog(row: pd.Series):
     """出馬表の行をクリックした際に、スクロール不要でその場にポップアップ表示する。"""
     render_horse_detail(row)
+
 # ==========================================================
 # 展開予想図（カード表示・スマホ幅対応）
 # ==========================================================
-PREV_LABEL_SHORT = {'F指数': 'F', 'S指数': 'S', 'FU2': 'FU2'}
+PREV_LABEL_SHORT = {'FU2': 'FU2', 'S指数': 'S', 'F指数': 'F'}
+# 展開予想図カードでのバッジ表示順（今走・前走とも共通。位置を揃えるため同じ順序を使う）
+TENKAI_BADGE_ORDER = ['FU2', 'S指数', 'F指数']
 
 def render_tenkai_view(df: pd.DataFrame, prev_index_map=None):
     st.markdown(
@@ -714,21 +725,23 @@ def render_tenkai_view(df: pd.DataFrame, prev_index_map=None):
         for _, row in cat_horses.iterrows():
             pass_str = row.get('前走通過順', '-')
             badges_html = ""
-            for idx_name in TARGET_INDICES:
+            for idx_name in TENKAI_BADGE_ORDER:
                 val = row.get(idx_name)
                 rank = row.get(f"{idx_name}_rank")
+                name_short = PREV_LABEL_SHORT[idx_name]
                 if pd.isna(val) or val == "":
                     badges_html += (
-                        "<span style='background:#111;color:white;border:1px solid #444;"
+                        "<span style='display:inline-block;min-width:40px;text-align:center;"
+                        "background:#111;color:white;border:1px solid #444;"
                         "border-radius:3px;padding:2px 5px;font-size:11px;margin-right:2px;'>-</span>"
                     )
                     continue
                 r = int(rank) if pd.notna(rank) else 99
                 bg_c, fg_c = RANK_COLORS.get(r, ("#111111", "white"))
-                name_short = idx_name.replace("指数", "")[:3]
                 label = f"{name_short} {val}"
                 badges_html += (
-                    f"<span style='background:{bg_c};color:{fg_c};border:1px solid #444;"
+                    f"<span style='display:inline-block;min-width:40px;text-align:center;"
+                    f"background:{bg_c};color:{fg_c};border:1px solid #444;"
                     f"border-radius:3px;padding:2px 5px;font-size:11px;margin-right:2px;'>{label}</span>"
                 )
 
@@ -749,27 +762,42 @@ def render_tenkai_view(df: pd.DataFrame, prev_index_map=None):
                 prev_values = prev_index_map.get(str(prev_id).strip(), {}) if pd.notna(prev_id) else {}
                 if prev_values:
                     prev_badges = []
-                    for label in PREV_LABEL_SHORT:
-                        if label not in prev_values:
+                    for label in TENKAI_BADGE_ORDER:
+                        name_short = PREV_LABEL_SHORT[label]
+                        info = prev_values.get(label)
+                        if info is None:
+                            prev_badges.append(
+                                "<span style='display:inline-block;min-width:40px;text-align:center;"
+                                "background:#111;color:white;border:1px solid #444;"
+                                "border-radius:3px;padding:2px 5px;font-size:11px;margin-right:2px;'>-</span>"
+                            )
                             continue
-                        info = prev_values[label]
-                        text = f"前{PREV_LABEL_SHORT[label]} {info['value']}"
+                        text = f"{name_short} {info['value']}"
                         if info['rank'] in RANK_COLORS:
                             bg, fg = RANK_COLORS[info['rank']]
                             prev_badges.append(
-                                f"<span style='background:{bg};color:{fg};border:1px solid #444;"
-                                f"border-radius:3px;padding:2px 5px;font-size:10px;"
-                                f"margin-right:2px;font-weight:bold;'>{text}</span>"
+                                f"<span style='display:inline-block;min-width:40px;text-align:center;"
+                                f"background:{bg};color:{fg};border:1px solid #444;"
+                                f"border-radius:3px;padding:2px 5px;font-size:11px;"
+                                f"margin-right:2px;'>{text}</span>"
                             )
                         else:
                             prev_badges.append(
-                                "<span style='background:#111;color:#8fbf8f;border:1px solid #444;"
-                                f"border-radius:3px;padding:2px 5px;font-size:10px;"
+                                "<span style='display:inline-block;min-width:40px;text-align:center;"
+                                "background:#111;color:white;border:1px solid #444;"
+                                f"border-radius:3px;padding:2px 5px;font-size:11px;"
                                 f"margin-right:2px;'>{text}</span>"
                             )
                     prev_html = (
-                        "<div style='padding:0 6px 6px;'>" + "".join(prev_badges) + "</div>"
+                        "<div style='padding:0 6px 6px;color:#999;font-size:10px;'>"
+                        "<span style='margin-right:4px;'>前走</span>"
+                        + "".join(prev_badges) + "</div>"
                     )
+
+            today_label_html = (
+                "<span style='color:#999;font-size:10px;margin-right:4px;'>今走</span>"
+                if prev_html else ""
+            )
 
             cards_html += (
                 "<div style='background:#2a1a1a;border:1px solid #555;border-radius:4px;"
@@ -777,12 +805,13 @@ def render_tenkai_view(df: pd.DataFrame, prev_index_map=None):
                 f"<div style='background:{cat_color};color:white;font-weight:bold;"
                 f"font-size:12px;padding:3px 6px;'>{waku_badge}{row.get('馬番', '')} {row.get('馬名', '')}</div>"
                 f"<div style='color:lightgray;font-size:11px;padding:3px 6px;'>前走: {pass_str}</div>"
-                f"<div style='padding:3px 6px 6px;'>{badges_html}</div>"
+                f"<div style='padding:3px 6px 6px;'>{today_label_html}{badges_html}</div>"
                 f"{prev_html}"
                 "</div>"
             )
         cards_html += "</div>"
         st.markdown(cards_html, unsafe_allow_html=True)
+
 # ==========================================================
 # メイン
 # ==========================================================
