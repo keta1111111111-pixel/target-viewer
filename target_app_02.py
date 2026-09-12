@@ -439,6 +439,11 @@ def main():
 
     df = load_main_csv(main_file)
 
+    # st.cache_data が古いバージョンの結果を保持している場合（デプロイ直後など）に備えて、
+    # レースキー列が無ければここで補っておく（自己修復）。
+    if RACE_KEY_COL not in df.columns:
+        df[RACE_KEY_COL] = get_race_key(df)
+
     for name, f in idx_uploads:
         df = merge_index_csv(df, name, f)
 
