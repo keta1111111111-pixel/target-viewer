@@ -51,7 +51,23 @@ NUMBERED_PAST_RACE_RE = re.compile(r'^前(\d+)走(.+)$')
 
 # 脚質（走り方）を表す列は、CSVの出力設定によって列名が異なることがあるため、
 # 複数の候補から最初に値が入っているものを使う。
-STYLE_COLS = ['前脚質', '前走決め手']
+# 「決手」はTARGETの「過去5走分込み」形式のCSVでの1走前の脚質列（今走欄には
+# 存在しないため列名の衝突は無い）。
+STYLE_COLS = ['前脚質', '前走決め手', '決手']
+
+# 直近走の3F順（末脚の順位）を表す列の候補。「上3F順位」は「過去5走分込み」
+# 形式のCSVでの1走前の列名。
+F3_RANK_COLS = ['前3F順', '上3F順位']
+
+# 直近走のコーナー通過順位を表す列の候補（1〜4コーナー）。「通過順1」「2」
+# 「3」「4」は「過去5走分込み」形式のCSVでの1走前の列名
+# （2〜4コーナーは今走欄に同名の列が無いため列名がそのまま流用されている）。
+PASSING_COL_CANDIDATES = {
+    1: ['前通過1', '通過順1'],
+    2: ['前通過2', '2'],
+    3: ['前通過3', '3'],
+    4: ['前通過4', '4'],
+}
 
 def first_nonempty(row, cols):
     for c in cols:
@@ -218,9 +234,9 @@ def render_race_info(race_meta, df_race: pd.DataFrame):
 def calc_position_and_patterns(df: pd.DataFrame) -> pd.DataFrame:
     def format_pass(row):
         passes = []
-        for p_col in ['前通過1', '前通過2', '前通過3', '前通過4']:
-            p = row.get(p_col)
-            if pd.notna(p) and str(p).strip() not in ['', 'nan', 'NaN']:
+        for corner in [1, 2, 3, 4]:
+            p = first_nonempty(row, PASSING_COL_CANDIDATES[corner])
+            if p is not None:
                 try:
                     passes.append(str(int(float(p))))
                 except Exception:
@@ -237,9 +253,9 @@ def calc_position_and_patterns(df: pd.DataFrame) -> pd.DataFrame:
         total_h = 16.0 if total_h is None or total_h <= 0 else total_h
 
         p_val = None
-        for p_col in ['前通過4', '前通過3', '前通過2', '前通過1']:
-            p = row.get(p_col)
-            if pd.notna(p) and str(p).strip() not in ['', 'nan', 'NaN']:
+        for corner in [4, 3, 2, 1]:
+            p = first_nonempty(row, PASSING_COL_CANDIDATES[corner])
+            if p is not None:
                 pv = safe_float(p)
                 if pv is not None:
                     p_val = pv
@@ -292,7 +308,7 @@ def calc_position_and_patterns(df: pd.DataFrame) -> pd.DataFrame:
     df['予想展開'] = df.apply(predict_pos, axis=1, race_size=race_size)
 
     def calc_3f_score(row):
-        f3 = safe_float(row.get('前3F順', 0))
+        f3 = safe_float(first_nonempty(row, F3_RANK_COLS), 0)
         total_h = safe_float(row.get('前頭数', 16))
         if f3 and total_h and f3 > 0 and total_h > 0:
             rel = max(0.0, min(1.0, 1.0 - (f3 - 1) / max(1.0, total_h - 1.0)))
@@ -304,7 +320,7 @@ def calc_position_and_patterns(df: pd.DataFrame) -> pd.DataFrame:
     def check_recommend(row):
         odds = safe_float(row.get('単オッズ', 0), 0.0)
         pos = row.get('予想展開', '')
-        f3_rank = safe_float(row.get('前3F順', 99), 99.0)
+        f3_rank = safe_float(first_nonempty(row, F3_RANK_COLS), 99.0)
 
         if pos in ['逃げ', '先行'] and 4.0 <= odds <= 30.0:
             return "先行妙味"
