@@ -101,6 +101,22 @@ def safe_float(v, default=None):
     except (TypeError, ValueError):
         return default
 
+# 過去走を使った分析で使う走数。
+# 指数推移・脚質安定性は「直近の調子」を見たいので直近走に絞り、
+# 同コース実績・好走時の脚質は該当例を見つけたいので取得できる分すべて使う。
+RECENT_WALKS = 5
+EXTENDED_WALKS = 20
+
+def detect_available_walks(df: pd.DataFrame, max_cap: int = EXTENDED_WALKS) -> int:
+    """出馬表CSVに実際に含まれる過去走の数（0〜max_cap）を検出する。
+    「ﾚｰｽ名･N走前」列が1走前から連番で存在する前提で判定する。"""
+    n = 0
+    for walk_no in range(1, max_cap + 1):
+        if f'ﾚｰｽ名･{walk_no}走前' not in df.columns:
+            break
+        n = walk_no
+    return n
+
 # ==========================================================
 # パスワード保護（Streamlit Cloudのsecretsに APP_PASSWORD を設定した場合のみ有効）
 # ==========================================================
@@ -531,6 +547,7 @@ def render_horse_detail(row: pd.Series):
                     st.markdown(f"**{label}**: {val}")
 
     render_prev_index_section(row)
+    render_style_analysis_section(row)
 
 # ==========================================================
 # 過去走データ（TARGETが出力する「過去5走分込み」形式のCSV対応）
@@ -555,6 +572,187 @@ def past_race_col(base_name: str, walk_no: int) -> str:
 
 # 各指数について、「同じ前走レース内での順位」が入っている列（TARGET側の出力名）
 PAST_INDEX_RANK_BASE = {'FU2': '順A', 'S指数': '順B', 'F指数': '順C'}
+
+def _clean_walk_value(v, header_name):
+    """出馬表CSVでレース区切りのヘッダー行がそのままデータに紛れ込む
+    （例：値が文字列「場所」になっている）ことがあるため、その場合は
+    データなし扱いにする。"""
+    if pd.isna(v):
+        return None
+    s = str(v).strip()
+    if not s or s in ('nan', 'NaN', header_name):
+        return None
+    return s
+
+def get_walk_style(row: pd.Series, walk_no: int):
+    """walk_no走前の脚質（決手）テキストを返す。無ければ None。"""
+    return _clean_walk_value(row.get(past_race_col('決手', walk_no)), '決手')
+
+def get_walk_finish(row: pd.Series, walk_no: int):
+    """walk_no走前の着順（数値）を返す。無ければ None。"""
+    v = _clean_walk_value(row.get(past_race_col('着順', walk_no)), '着順')
+    return safe_float(v)
+
+def get_walk_race_name(row: pd.Series, walk_no: int):
+    """walk_no走前のレース名を返す。無ければ None。"""
+    col = f'ﾚｰｽ名･{walk_no}走前'
+    return _clean_walk_value(row.get(col), col)
+
+def get_walk_date(row: pd.Series, walk_no: int):
+    """walk_no走前の日付（文字列）を返す。無ければ None。"""
+    col = f'日付S･{walk_no}前'
+    return _clean_walk_value(row.get(col), col)
+
+def normalize_surface(v):
+    """芝・ダート区分の表記ゆれ（今走欄「ダート」/過去走欄「ダ」、
+    障害レースの細区分など）を吸収して大まかな区分にそろえる。"""
+    if v is None:
+        return None
+    if '障' in v:
+        return '障害'
+    if 'ダ' in v:
+        return 'ダート'
+    if '芝' in v:
+        return '芝'
+    return v
+
+def get_today_course(row: pd.Series):
+    """今走の(場所, 芝ダ区分, 距離)を返す。値が欠けていればNoneを含む。"""
+    venue = _clean_walk_value(row.get('場所'), '場所')
+    surface = normalize_surface(_clean_walk_value(row.get('芝・ダート'), '芝・ダート'))
+    distance = _clean_walk_value(row.get('距離'), '距離')
+    return (venue, surface, distance)
+
+def get_walk_course(row: pd.Series, walk_no: int):
+    """walk_no走前の(場所, 芝ダ区分, 距離)を返す。値が欠けていればNoneを含む。"""
+    venue = _clean_walk_value(row.get(past_race_col('場所', walk_no)), '場所')
+    surface = normalize_surface(_clean_walk_value(row.get(past_race_col('芝・ダ', walk_no)), '芝・ダ'))
+    distance = _clean_walk_value(row.get(past_race_col('距離', walk_no)), '距離')
+    return (venue, surface, distance)
+
+def is_same_course(row: pd.Series, walk_no: int) -> bool:
+    """walk_no走前が今走と「場所・芝ダート区分・距離」すべて完全一致するか。"""
+    today = get_today_course(row)
+    if any(v is None for v in today):
+        return False
+    past = get_walk_course(row, walk_no)
+    if any(v is None for v in past):
+        return False
+    return today == past
+
+# 脚質安定性の判定しきい値（重み付き最頻値の得票率）
+STYLE_STABILITY_THRESHOLDS = (0.6, 0.4)  # (安定, やや不安定) の境界
+
+def compute_style_stability(row: pd.Series, num_walks: int = RECENT_WALKS):
+    """直近num_walks走の脚質（決手）から、最も多い脚質とその安定度を求める。
+    今走と同コース（完全一致）の走は2票分として重み付けする。
+    有効データが2走未満の場合は安定度を判定せず「データ不足」とする。
+    sequenceは古い→新しい順（例：num_walks走前→1走前）。"""
+    votes = {}
+    sequence = []
+    valid_count = 0
+    for walk_no in range(num_walks, 0, -1):
+        style = get_walk_style(row, walk_no)
+        sequence.append(style or '-')
+        if style is None:
+            continue
+        valid_count += 1
+        weight = 2.0 if is_same_course(row, walk_no) else 1.0
+        votes[style] = votes.get(style, 0.0) + weight
+
+    if valid_count < 2:
+        return {'mode': None, 'ratio': None, 'label': 'データ不足', 'sequence': sequence}
+
+    total_weight = sum(votes.values())
+    mode_style = max(votes, key=votes.get)
+    ratio = votes[mode_style] / total_weight
+    if ratio >= STYLE_STABILITY_THRESHOLDS[0]:
+        label = '安定'
+    elif ratio >= STYLE_STABILITY_THRESHOLDS[1]:
+        label = 'やや不安定'
+    else:
+        label = '不安定'
+    return {'mode': mode_style, 'ratio': ratio, 'label': label, 'sequence': sequence}
+
+# 「好走」とみなす着順のしきい値（3着以内）
+GOOD_FINISH_THRESHOLD = 3
+
+def compute_good_run_style(row: pd.Series, num_walks: int = EXTENDED_WALKS):
+    """好走（着順3着以内）だった走に絞って、最も多い脚質を求める。
+    好走が2走未満しか無い場合は判断材料として不十分なため None を返す。"""
+    votes = {}
+    good_total = 0
+    for walk_no in range(1, num_walks + 1):
+        finish = get_walk_finish(row, walk_no)
+        if finish is None or finish > GOOD_FINISH_THRESHOLD:
+            continue
+        style = get_walk_style(row, walk_no)
+        if style is None:
+            continue
+        good_total += 1
+        votes[style] = votes.get(style, 0) + 1
+
+    if good_total < 2 or not votes:
+        return None
+
+    mode_style = max(votes, key=votes.get)
+    return {'mode': mode_style, 'count': votes[mode_style], 'good_total': good_total}
+
+# 指数推移で上昇/下降と判定する変化率のしきい値
+INDEX_TREND_THRESHOLD = 0.10
+
+def compute_index_trend(row: pd.Series, idx_name: str, num_walks: int = RECENT_WALKS):
+    """今走のidx_name（F指数/S指数/FU2）の値を、直近num_walks走の平均と比較し、
+    上昇/下降/横ばいを判定する。今走の値または比較対象が無ければ None。"""
+    today_val = safe_float(row.get(idx_name))
+    if today_val is None:
+        return None
+
+    past_values = []
+    for walk_no in range(1, num_walks + 1):
+        info = get_past_index_info(row, idx_name, walk_no)
+        if info is not None:
+            v = safe_float(info['value'])
+            if v is not None:
+                past_values.append(v)
+
+    if not past_values:
+        return None
+
+    avg = sum(past_values) / len(past_values)
+    if avg == 0:
+        return None
+    pct_change = (today_val - avg) / avg
+
+    if pct_change >= INDEX_TREND_THRESHOLD:
+        label = '上昇'
+    elif pct_change <= -INDEX_TREND_THRESHOLD:
+        label = '下降'
+    else:
+        label = '横ばい'
+
+    return {'today': today_val, 'avg': round(avg, 1), 'pct_change': pct_change, 'label': label}
+
+def compute_pace_forecast(df: pd.DataFrame):
+    """レース全体の予想展開から、信頼できる（脚質安定性が安定/やや不安定の）
+    逃げ・先行馬の頭数を数え、レースのペースを予想する。"""
+    reliable = []
+    for _, row in df.iterrows():
+        pos = row.get('予想展開', '')
+        if pos not in ('逃げ', '先行'):
+            continue
+        stability = compute_style_stability(row)
+        if stability['label'] in ('安定', 'やや不安定'):
+            reliable.append(f"{row.get('馬番', '')}{row.get('馬名', '')}")
+
+    n = len(reliable)
+    if n <= 1:
+        label = 'スロー想定'
+    elif n == 2:
+        label = 'ミドル想定'
+    else:
+        label = 'ハイ想定'
+    return {'label': label, 'reliable_front_runners': reliable}
 
 def _has_past_index_cols(columns, walk_no: int = 1) -> bool:
     col_set = set(columns)
@@ -602,6 +800,44 @@ def render_prev_index_section(row: pd.Series):
             else:
                 st.markdown(f"**{idx_name}**: {info['value']}")
 
+INDEX_TREND_ARROWS = {'上昇': '↑', '下降': '↓', '横ばい': '→'}
+
+def render_style_analysis_section(row: pd.Series):
+    """脚質安定性・好走時の脚質・指数推移をまとめて表示する
+    （TARGETの「過去N走分込み」形式のCSVでのみ有効）。"""
+    if past_race_col('決手', 1) not in row.index:
+        return
+
+    with st.expander("脚質・指数の分析", expanded=True):
+        stability = compute_style_stability(row)
+        if stability['mode']:
+            st.markdown(
+                f"**脚質安定性**：{stability['label']}"
+                f"（{stability['mode']} {stability['ratio']:.0%}）"
+            )
+        else:
+            st.markdown(f"**脚質安定性**：{stability['label']}")
+        st.caption("推移（古い→新しい）：" + " → ".join(stability['sequence']))
+
+        good = compute_good_run_style(row)
+        if good:
+            st.markdown(
+                f"**好走時の脚質**：{good['mode']}"
+                f"（好走{good['good_total']}走中{good['count']}走）"
+            )
+        else:
+            st.markdown("**好走時の脚質**：データ不足")
+
+        for idx_name in TENKAI_BADGE_ORDER:
+            trend = compute_index_trend(row, idx_name)
+            if trend is None:
+                continue
+            arrow = INDEX_TREND_ARROWS[trend['label']]
+            st.markdown(
+                f"**{idx_name}推移**：今走{trend['today']:g} vs 過去平均{trend['avg']:g}"
+                f"（{trend['pct_change']:+.0%} {arrow}{trend['label']}）"
+            )
+
 @st.dialog("馬詳細")
 def show_horse_detail_dialog(row: pd.Series):
     """出馬表の行をクリックした際に、スクロール不要でその場にポップアップ表示する。"""
@@ -620,6 +856,19 @@ def render_tenkai_view(df: pd.DataFrame):
         "逃 → 先 → 先差 → 差 → 追　/　同じ段では左（上）ほど前寄り</p>",
         unsafe_allow_html=True,
     )
+
+    if past_race_col('決手', 1) in df.columns:
+        pace = compute_pace_forecast(df)
+        runners_note = (
+            f"（信頼できる先行馬：{', '.join(pace['reliable_front_runners'])}）"
+            if pace['reliable_front_runners'] else "（信頼できる先行馬なし）"
+        )
+        st.markdown(
+            f"<div style='background:#1a1a2e;color:white;font-weight:bold;"
+            f"padding:8px 12px;border-radius:6px;margin-bottom:10px;'>"
+            f"推定ペース：{pace['label']}{runners_note}</div>",
+            unsafe_allow_html=True,
+        )
 
     df_sorted = df.sort_values(by='先行スコア', ascending=False)
     show_prev = _has_past_index_cols(df.columns)
@@ -731,6 +980,81 @@ def render_tenkai_view(df: pd.DataFrame):
         st.markdown(cards_html, unsafe_allow_html=True)
 
 # ==========================================================
+# 近走成績（過去N走を表形式で一覧表示）
+# ==========================================================
+def build_recent_races_table(row: pd.Series, num_walks: int):
+    """指定した馬の直近num_walks走を、古い→新しい順のDataFrameにまとめる。
+    レース名が取得できない走（データが無い）はスキップする。"""
+    records = []
+    for walk_no in range(num_walks, 0, -1):
+        race_name = get_walk_race_name(row, walk_no)
+        if race_name is None:
+            continue
+        venue, surface, distance = get_walk_course(row, walk_no)
+        finish = get_walk_finish(row, walk_no)
+        info_fu2 = get_past_index_info(row, 'FU2', walk_no)
+        info_s = get_past_index_info(row, 'S指数', walk_no)
+        info_f = get_past_index_info(row, 'F指数', walk_no)
+        records.append({
+            '走': f"{walk_no}走前",
+            '日付': get_walk_date(row, walk_no) or '-',
+            'レース名': race_name,
+            '場所': venue or '-',
+            '芝ダ': surface or '-',
+            '距離': distance or '-',
+            '着順': int(finish) if finish is not None else None,
+            '脚質': get_walk_style(row, walk_no) or '-',
+            'FU2': info_fu2['value'] if info_fu2 else '-',
+            'S指数': info_s['value'] if info_s else '-',
+            'F指数': info_f['value'] if info_f else '-',
+            '同コース': is_same_course(row, walk_no),
+        })
+    return pd.DataFrame(records)
+
+def render_recent_races_tab(df_race: pd.DataFrame):
+    """選択した馬の過去走を表形式で一覧表示する
+    （TARGETの「過去N走分込み」形式のCSVでのみ有効）。"""
+    if past_race_col('決手', 1) not in df_race.columns:
+        st.info("この出馬表CSVには過去走データが含まれていません。")
+        return
+
+    horse_labels = [
+        f"{row.get('馬番', '')} {row.get('馬名', '')}"
+        for _, row in df_race.iterrows()
+    ]
+    if not horse_labels:
+        st.info("表示できる馬がいません。")
+        return
+
+    selected = st.selectbox("馬を選択", options=horse_labels)
+    row = df_race.iloc[horse_labels.index(selected)]
+
+    num_walks = detect_available_walks(df_race)
+    if num_walks == 0:
+        st.info("過去走データが見つかりませんでした。")
+        return
+
+    hist_df = build_recent_races_table(row, num_walks)
+    if hist_df.empty:
+        st.info("この馬の過去走データが見つかりませんでした。")
+        return
+
+    def highlight_row(r):
+        style = ''
+        if r['同コース']:
+            style += 'background-color:#fff3cd;'
+        if r['着順'] is not None and r['着順'] <= GOOD_FINISH_THRESHOLD:
+            style += 'font-weight:bold;color:#1a53ff;'
+        return [style] * len(r)
+
+    display_df = hist_df.drop(columns=['同コース'])
+    styler = display_df.style.apply(
+        lambda r: highlight_row(hist_df.loc[r.name]), axis=1
+    )
+    st.caption("背景色＝今走と同コース（場所・芝ダート・距離が完全一致） / 太字青字＝3着以内")
+    st.dataframe(styler, use_container_width=True, hide_index=True)
+
+# ==========================================================
 # メイン
 # ==========================================================
 def main():
@@ -791,7 +1115,7 @@ def main():
         '予想展開', '前走通過順', 'F指数', 'S指数', 'FU2',
     ] if c in all_cols]
 
-    tab_table, tab_tenkai = st.tabs(["📋 出馬表", "🗺️ 展開予想図"])
+    tab_table, tab_tenkai, tab_recent = st.tabs(["📋 出馬表", "🗺️ 展開予想図", "📖 近走成績"])
 
     with tab_table:
         with st.popover("⚙️ 表示する項目"):
@@ -835,6 +1159,9 @@ def main():
 
     with tab_tenkai:
         render_tenkai_view(df_race)
+
+    with tab_recent:
+        render_recent_races_tab(df_race)
 
 if __name__ == "__main__":
     main()
