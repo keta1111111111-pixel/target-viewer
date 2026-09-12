@@ -5,9 +5,6 @@ TARGET 指数＆展開予測ビューア (Streamlit版)
 Streamlit Community Cloud へのデプロイを想定。
 """
 
-import concurrent.futures
-import io
-import json
 import re
 import pandas as pd
 import streamlit as st
@@ -63,9 +60,18 @@ def first_nonempty(row, cols):
             return v
     return None
 
-# レースを一意に識別するための列（出馬表CSVの「場所」「Ｒ」列）
-RACE_KEY_COLS = ['場所', 'Ｒ']
+# レースを一意に識別するための列（出馬表CSVの「場所」「Ｒ」列）。
+# 「Ｒ」列はCSVの出力設定によって全角「Ｒ」・半角「R」のどちらの場合もあるため、
+# 実際に存在する方を都度解決する。
 RACE_KEY_COL = '__race_key__'
+
+def race_number_col(df: pd.DataFrame):
+    """出馬表CSVのレース番号列（全角「Ｒ」または半角「R」）の実際の列名を返す。
+    どちらも存在しなければ None。"""
+    for c in ('Ｒ', 'R'):
+        if c in df.columns:
+            return c
+    return None
 
 # JRA場所コード（指数ファイルのID中の場所コードをレース名に変換するために使用）
 VENUE_CODE_MAP = {
@@ -104,13 +110,14 @@ def check_password() -> bool:
 # レース単位のグルーピング
 # ==========================================================
 def has_race_columns(df: pd.DataFrame) -> bool:
-    return all(c in df.columns for c in RACE_KEY_COLS)
+    return '場所' in df.columns and race_number_col(df) is not None
 
 def get_race_key(df: pd.DataFrame) -> pd.Series:
     """出馬表1行ごとに、どのレースに属するかを表すキーを返す。
     「場所」「Ｒ」列が無いCSV（旧形式）の場合は全行を1つのレース扱いにする。"""
     if has_race_columns(df):
-        return df['場所'].astype(str) + '_' + df['Ｒ'].astype(str)
+        r_col = race_number_col(df)
+        return df['場所'].astype(str) + '_' + df[r_col].astype(str)
     return pd.Series(['__all__'] * len(df), index=df.index)
 
 def build_race_options(df: pd.DataFrame):
@@ -119,13 +126,14 @@ def build_race_options(df: pd.DataFrame):
     if not has_race_columns(df) or RACE_KEY_COL not in df.columns:
         return None
 
+    r_col = race_number_col(df)
     rows = []
     for key, g in df.groupby(RACE_KEY_COL, sort=False):
         first = g.iloc[0]
         rows.append({
             'key': key,
             '場所': first.get('場所', ''),
-            'Ｒ': first.get('Ｒ', ''),
+            'Ｒ': first.get(r_col, ''),
             'レース名': first.get('レース名', ''),
             '発走時刻': first.get('発走時刻', ''),
             '芝ダ': first.get('芝ダ', ''),
@@ -332,9 +340,34 @@ def group_previous_race_columns(columns):
 # ==========================================================
 # データ読み込み（アップロードファイルから）
 # ==========================================================
+def normalize_today_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """TARGETの「過去5走分込み」形式のCSVでは、今走の基本項目の列名が
+    従来形式と異なる（馬番→番、馬名→馬名S、単オッズ→ 単勝〈先頭スペース〉）。
+    さらに「馬番」「場所」など一部の項目名は過去走ブロックでも再利用され、
+    そちらが優先的にpandasの列名として残ることがある（例：「馬番」は
+    実際には1走前の馬番＝今走とは無関係の値になっている）。
+    そのため、今走用の別名列が存在する場合は、既存の同名列（＝過去走側の
+    データ）を退避してから、今走の値で上書きする。"""
+    aliases = {
+        '馬番': '番',
+        '馬名': '馬名S',
+        '単オッズ': ' 単勝',
+    }
+    for canonical, alias in aliases.items():
+        if alias not in df.columns:
+            continue
+        if canonical in df.columns:
+            # 既存の同名列は今走のものではない（過去走ブロック由来）ため、
+            # データを失わないよう別名で退避してから上書きする。
+            if f'{canonical}_過去走由来' not in df.columns:
+                df[f'{canonical}_過去走由来'] = df[canonical]
+        df[canonical] = df[alias]
+    return df
+
 @st.cache_data(show_spinner=False)
 def load_main_csv(file_bytes) -> pd.DataFrame:
     df = pd.read_csv(file_bytes, dtype=str, encoding="cp932")
+    df = normalize_today_columns(df)
     df = calc_position_and_patterns(df)
     return df
 
@@ -376,7 +409,9 @@ def merge_index_csv(df: pd.DataFrame, idx_name: str, file_bytes) -> pd.DataFrame
     # 馬番は1日の中でレースごとに1〜16番が重複するため、馬番だけでの結合は
     # 複数レースが混在するCSVでは別レースの馬に値を取り違えてしまう。
     if has_race_columns(df):
-        merge_keys = ['場所', 'Ｒ', '馬番']
+        r_col = race_number_col(df)
+        df_idx = df_idx.rename(columns={'Ｒ': r_col})
+        merge_keys = ['場所', r_col, '馬番']
         df_idx = df_idx[df_idx['場所'] != ""]
     else:
         merge_keys = ['馬番']
@@ -482,208 +517,74 @@ def render_horse_detail(row: pd.Series):
     render_prev_index_section(row)
 
 # ==========================================================
-# Google Drive 連携（前走時点の指数を日次アーカイブから検索して取得）
+# 過去走データ（TARGETが出力する「過去5走分込み」形式のCSV対応）
 # ==========================================================
-PREV_RACE_ID_COL = '前レースID(新)'
-
-# 表示ラベル → Driveの「外部指数」フォルダ直下のサブフォルダ名
-DRIVE_INDEX_FOLDER_NAMES = {
-    'F指数': 'F指数',
-    'S指数': 'S指数',
-    'FU2': 'FU2',
+# 出馬表CSVが「今走」の列に加えて1走前〜5走前の列をまとめて含む場合、
+# 同じ項目名（騎手・場所・距離・斤量・人気・FU2・S指数・F指数・arms2・
+# レースID(新)など）が「今走」欄でも使われているため、pandasの重複列名
+# 自動リネームにより「N走前」の実際の列名は以下のいずれかになる。
+#   ・今走欄にも同名の列がある項目 → f"{項目名}.{N}"
+#   ・今走欄には無い項目（着順・通過順など過去走特有の項目） →
+#       1走前は項目名そのまま、2走前以降は f"{項目名}.{N-1}"
+PAST_RACE_COLS_CLASH_WITH_TODAY = {
+    '騎手', '場所', '距離', '斤量', '人気', 'FU2', 'S指数', 'F指数',
+    'arms2', 'レースID(新)', 'B',
 }
 
-def drive_configured() -> bool:
-    return bool(st.secrets.get("gcp_service_account")) and bool(st.secrets.get("DRIVE_ROOT_FOLDER_ID"))
+def past_race_col(base_name: str, walk_no: int) -> str:
+    """出馬表CSVに含まれる「walk_no走前」のbase_name列の実際の列名を返す。"""
+    if base_name in PAST_RACE_COLS_CLASH_WITH_TODAY:
+        return f"{base_name}.{walk_no}"
+    return base_name if walk_no == 1 else f"{base_name}.{walk_no - 1}"
 
-def _load_service_account_info():
-    raw = st.secrets["gcp_service_account"]
-    # secrets.toml に [gcp_service_account] の表として書いた場合と、
-    # JSONの中身をそのまま文字列として貼った場合の両方に対応する。
-    if isinstance(raw, str):
-        # private_key 内の改行が「\n」ではなく実際の改行のまま貼られている場合、
-        # 通常のJSONパーサはエラーになるため strict=False で許容する。
-        return json.loads(raw, strict=False)
-    return dict(raw)
+# 各指数について、「同じ前走レース内での順位」が入っている列（TARGET側の出力名）
+PAST_INDEX_RANK_BASE = {'FU2': '順A', 'S指数': '順B', 'F指数': '順C'}
 
-@st.cache_resource(show_spinner=False)
-def get_service_account_credentials():
-    from google.oauth2 import service_account
-    info = _load_service_account_info()
-    return service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/drive.readonly"],
-    )
+def _has_past_index_cols(columns, walk_no: int = 1) -> bool:
+    col_set = set(columns)
+    return all(past_race_col(name, walk_no) in col_set for name in TENKAI_BADGE_ORDER)
 
-def build_drive_service():
-    """呼び出しごとに新しいHTTPトランスポートでDriveサービスを作る。
-    googleapiclient（httplib2）は複数スレッドで同じインスタンスを共有すると
-    問題が起きるため、並列実行するスレッドではそれぞれ新しく作る。"""
-    from googleapiclient.discovery import build
-    creds = get_service_account_credentials()
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-@st.cache_resource(show_spinner=False)
-def get_drive_service():
-    return build_drive_service()
-
-@st.cache_data(show_spinner=False, ttl=6 * 3600)
-def list_drive_children(folder_id: str, _service=None):
-    """指定フォルダ直下のファイル/フォルダ一覧を返す（サブフォルダは再帰しない）。"""
-    service = _service or get_drive_service()
-    items = []
-    page_token = None
-    while True:
-        res = service.files().list(
-            q=f"'{folder_id}' in parents and trashed = false",
-            fields="nextPageToken, files(id, name, mimeType)",
-            pageToken=page_token,
-            pageSize=1000,
-        ).execute()
-        items.extend(res.get('files', []))
-        page_token = res.get('nextPageToken')
-        if not page_token:
-            break
-    return items
-
-def find_child_folder(parent_id: str, name: str, service=None):
-    for child in list_drive_children(parent_id, _service=service):
-        if child['mimeType'] == 'application/vnd.google-apps.folder' and child['name'] == name:
-            return child['id']
-    return None
-
-def find_date_file_in_tree(folder_id: str, yyyymmdd: str, depth: int = 0, max_depth: int = 4, service=None):
-    """フォルダ以下を探索し、ファイル名に yyyymmdd を含むファイルを探す。
-    年フォルダなど中間階層の名前は問わず、任意の深さの入れ子に対応する。
-    該当年に近いフォルダから優先的に探索し、無駄なAPI呼び出しを減らす。"""
-    children = list_drive_children(folder_id, _service=service)
-    files = [c for c in children if c['mimeType'] != 'application/vnd.google-apps.folder']
-    match = next((f for f in files if yyyymmdd in f['name']), None)
-    if match:
-        return match
-    if depth >= max_depth:
+def get_past_index_info(row: pd.Series, idx_name: str, walk_no: int = 1):
+    """出馬表CSVの1行から、walk_no走前のidx_name（F指数/S指数/FU2）の
+    値と、その前走レース内での順位（1〜3位のみ色分け対象）を取り出す。
+    値が無ければ None。"""
+    value_col = past_race_col(idx_name, walk_no)
+    val = row.get(value_col)
+    if pd.isna(val) or str(val).strip() == '':
         return None
-
-    year = yyyymmdd[:4]
-    subfolders = [c for c in children if c['mimeType'] == 'application/vnd.google-apps.folder']
-    subfolders.sort(key=lambda f: 0 if year in f['name'] else 1)
-    for sf in subfolders:
-        result = find_date_file_in_tree(sf['id'], yyyymmdd, depth + 1, max_depth, service=service)
-        if result:
-            return result
-    return None
-
-@st.cache_data(show_spinner=False)
-def download_drive_index_file(file_id: str, _service=None) -> pd.DataFrame:
-    service = _service or get_drive_service()
-    content = service.files().get_media(fileId=file_id).execute()
-    df = pd.read_csv(io.BytesIO(content), header=None, sep=r'[\t,]', engine='python',
-                      dtype=str, encoding='cp932')
-    df = df.iloc[:, [0, 1]].dropna()
-    df.columns = ['ID', 'value']
-    return df
-
-def lookup_prev_indices_for_ids(root_folder_id: str, prev_race_ids):
-    """複数の前レースID(新)について、F指数・S指数・FU2をまとめて取得する。
-    {前レースID: {表示ラベル: {'value':値, 'rank':順位, 'total':頭数}}} を返す。
-    順位は「同じ前走レース（IDの先頭16桁が一致する馬たち）」の中での
-    その指数の順位（降順・同値は同順位）。
-    同じ日付のIDは同じアーカイブファイルを共有するため、(ラベル, 日付) の
-    組み合わせ単位でファイルをまとめて並列ダウンロードしてから、
-    それぞれのIDをその場で引く（ファイル取得のAPI呼び出しを最小化する）。"""
-    valid_ids = sorted({
-        str(rid).strip() for rid in prev_race_ids
-        if rid is not None and pd.notna(rid) and len(str(rid).strip()) >= 8
-        and str(rid).strip()[:8].isdigit()
-    })
-    if not valid_ids:
-        return {}
-
-    dates_needed = sorted({rid[:8] for rid in valid_ids})
-    labels = list(DRIVE_INDEX_FOLDER_NAMES.keys())
-    tasks = [(label, ymd) for label in labels for ymd in dates_needed]
-
-    def fetch_one(label, yyyymmdd):
-        thread_service = build_drive_service()
-        folder_name = DRIVE_INDEX_FOLDER_NAMES[label]
-        top_folder_id = find_child_folder(root_folder_id, folder_name, service=thread_service)
-        if not top_folder_id:
-            return (label, yyyymmdd), None
-        target_file = find_date_file_in_tree(top_folder_id, yyyymmdd, service=thread_service)
-        if not target_file:
-            return (label, yyyymmdd), None
-        return (label, yyyymmdd), download_drive_index_file(target_file['id'], _service=thread_service)
-
-    file_cache = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(fetch_one, label, ymd) for label, ymd in tasks]
-        for fut in concurrent.futures.as_completed(futures):
-            key, df = fut.result()
-            file_cache[key] = df
-
-    results = {}
-    for rid in valid_ids:
-        ymd = rid[:8]
-        race_prefix = rid[:16]  # 日付+場所+回+日+Ｒ（馬番を除いた「同じレース」の単位）
-        values = {}
-        for label in labels:
-            df = file_cache.get((label, ymd))
-            if df is None:
-                continue
-            race_df = df[df['ID'].str[:16] == race_prefix].copy()
-            race_df['value_num'] = pd.to_numeric(race_df['value'], errors='coerce')
-            race_df = race_df.dropna(subset=['value_num'])
-            if race_df.empty:
-                continue
-            race_df['rank'] = race_df['value_num'].rank(ascending=False, method='min')
-            row = race_df[race_df['ID'] == rid]
-            if not row.empty:
-                values[label] = {
-                    'value': row.iloc[0]['value'],
-                    'rank': int(row.iloc[0]['rank']),
-                    'total': len(race_df),
-                }
-        results[rid] = values
-    return results
-
-@st.cache_data(show_spinner=False)
-def cached_prev_indices_for_race(root_folder_id: str, prev_ids_tuple: tuple):
-    """レース単位で前走指数の検索結果をキャッシュする。
-    タブ切り替えや列選択のたびにDriveへ再アクセスしないようにする。"""
-    return lookup_prev_indices_for_ids(root_folder_id, list(prev_ids_tuple))
+    rank_col = past_race_col(PAST_INDEX_RANK_BASE[idx_name], walk_no)
+    rank = row.get(rank_col)
+    rank_int = None
+    if pd.notna(rank) and str(rank).strip() != '':
+        try:
+            rank_int = int(float(rank))
+        except (TypeError, ValueError):
+            rank_int = None
+    return {'value': val, 'rank': rank_int}
 
 def render_prev_index_section(row: pd.Series):
-    """Google Driveが設定されていれば、前走時点のF指数・S指数・FU2を
-    アーカイブから検索して表示する。今走の指数と同じく、同じ前走レース内で
-    1〜3位だった場合のみ色を付ける（4位以下・順位不明時は色なし）。"""
-    if not drive_configured():
-        return
-    prev_id = row.get(PREV_RACE_ID_COL)
-    if pd.isna(prev_id) or not str(prev_id).strip():
+    """出馬表CSVに1走前の指数データ（TARGETの「過去5走分込み」形式）が
+    含まれていれば、前走時点のFU2・S指数・F指数を表示する。今走の指数と
+    同じく、同じ前走レース内で1〜3位だった場合のみ色を付ける。"""
+    if not _has_past_index_cols(row.index):
         return
 
-    with st.expander("前走時点の指数（Google Drive）", expanded=True):
-        root_id = st.secrets["DRIVE_ROOT_FOLDER_ID"]
-        try:
-            with st.spinner("Google Driveを検索中..."):
-                results = lookup_prev_indices_for_ids(root_id, [prev_id])
-            values = results.get(str(prev_id).strip(), {})
-            for label in ['F指数', 'S指数', 'FU2']:
-                info = values.get(label)
-                if info is None:
-                    st.markdown(f"**{label}**: 見つかりません")
-                    continue
-                if info['rank'] in RANK_COLORS:
-                    bg, fg = RANK_COLORS[info['rank']]
-                    st.markdown(
-                        f"**{label}**: <span style='background:{bg};color:{fg};"
-                        f"padding:2px 8px;border-radius:4px;font-weight:bold;'>"
-                        f"{info['value']}</span>",
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    st.markdown(f"**{label}**: {info['value']}")
-        except Exception as e:
-            st.warning(f"Google Driveからの取得に失敗しました: {e}")
+    with st.expander("前走時点の指数", expanded=True):
+        for idx_name in TENKAI_BADGE_ORDER:
+            info = get_past_index_info(row, idx_name, walk_no=1)
+            if info is None:
+                st.markdown(f"**{idx_name}**: 見つかりません")
+                continue
+            if info['rank'] in RANK_COLORS:
+                bg, fg = RANK_COLORS[info['rank']]
+                st.markdown(
+                    f"**{idx_name}**: <span style='background:{bg};color:{fg};"
+                    f"padding:2px 8px;border-radius:4px;font-weight:bold;'>"
+                    f"{info['value']}</span>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(f"**{idx_name}**: {info['value']}")
 
 @st.dialog("馬詳細")
 def show_horse_detail_dialog(row: pd.Series):
@@ -697,7 +598,7 @@ PREV_LABEL_SHORT = {'FU2': 'FU2', 'S指数': 'S', 'F指数': 'F'}
 # 展開予想図カードでのバッジ表示順（今走・前走とも共通。位置を揃えるため同じ順序を使う）
 TENKAI_BADGE_ORDER = ['FU2', 'S指数', 'F指数']
 
-def render_tenkai_view(df: pd.DataFrame, prev_index_map=None):
+def render_tenkai_view(df: pd.DataFrame):
     st.markdown(
         "<p style='color:#aaaaaa;font-size:13px;'>"
         "逃 → 先 → 先差 → 差 → 追　/　同じ段では左（上）ほど前寄り</p>",
@@ -705,6 +606,7 @@ def render_tenkai_view(df: pd.DataFrame, prev_index_map=None):
     )
 
     df_sorted = df.sort_values(by='先行スコア', ascending=False)
+    show_prev = _has_past_index_cols(df.columns)
 
     for cat in CATEGORY_ORDER:
         cat_color = CATEGORY_COLORS[cat]
@@ -760,42 +662,39 @@ def render_tenkai_view(df: pd.DataFrame, prev_index_map=None):
                 waku_badge = ""
 
             prev_html = ""
-            if prev_index_map is not None:
-                prev_id = row.get(PREV_RACE_ID_COL)
-                prev_values = prev_index_map.get(str(prev_id).strip(), {}) if pd.notna(prev_id) else {}
-                if prev_values:
-                    prev_badges = []
-                    for label in TENKAI_BADGE_ORDER:
-                        name_short = PREV_LABEL_SHORT[label]
-                        info = prev_values.get(label)
-                        if info is None:
-                            prev_badges.append(
-                                "<span style='display:inline-block;min-width:40px;text-align:center;"
-                                "background:#111;color:white;border:1px solid #444;"
-                                "border-radius:3px;padding:2px 5px;font-size:11px;margin-right:2px;'>-</span>"
-                            )
-                            continue
-                        text = f"{name_short} {info['value']}"
-                        if info['rank'] in RANK_COLORS:
-                            bg, fg = RANK_COLORS[info['rank']]
-                            prev_badges.append(
-                                f"<span style='display:inline-block;min-width:40px;text-align:center;"
-                                f"background:{bg};color:{fg};border:1px solid #444;"
-                                f"border-radius:3px;padding:2px 5px;font-size:11px;"
-                                f"margin-right:2px;'>{text}</span>"
-                            )
-                        else:
-                            prev_badges.append(
-                                "<span style='display:inline-block;min-width:40px;text-align:center;"
-                                "background:#111;color:white;border:1px solid #444;"
-                                f"border-radius:3px;padding:2px 5px;font-size:11px;"
-                                f"margin-right:2px;'>{text}</span>"
-                            )
-                    prev_html = (
-                        "<div style='padding:0 6px 6px;color:#999;font-size:10px;'>"
-                        "<span style='margin-right:4px;'>前走</span>"
-                        + "".join(prev_badges) + "</div>"
-                    )
+            if show_prev:
+                prev_badges = []
+                for label in TENKAI_BADGE_ORDER:
+                    name_short = PREV_LABEL_SHORT[label]
+                    info = get_past_index_info(row, label, walk_no=1)
+                    if info is None:
+                        prev_badges.append(
+                            "<span style='display:inline-block;min-width:40px;text-align:center;"
+                            "background:#111;color:white;border:1px solid #444;"
+                            "border-radius:3px;padding:2px 5px;font-size:11px;margin-right:2px;'>-</span>"
+                        )
+                        continue
+                    text = f"{name_short} {info['value']}"
+                    if info['rank'] in RANK_COLORS:
+                        bg, fg = RANK_COLORS[info['rank']]
+                        prev_badges.append(
+                            f"<span style='display:inline-block;min-width:40px;text-align:center;"
+                            f"background:{bg};color:{fg};border:1px solid #444;"
+                            f"border-radius:3px;padding:2px 5px;font-size:11px;"
+                            f"margin-right:2px;'>{text}</span>"
+                        )
+                    else:
+                        prev_badges.append(
+                            "<span style='display:inline-block;min-width:40px;text-align:center;"
+                            "background:#111;color:white;border:1px solid #444;"
+                            f"border-radius:3px;padding:2px 5px;font-size:11px;"
+                            f"margin-right:2px;'>{text}</span>"
+                        )
+                prev_html = (
+                    "<div style='padding:0 6px 6px;color:#999;font-size:10px;'>"
+                    "<span style='margin-right:4px;'>前走</span>"
+                    + "".join(prev_badges) + "</div>"
+                )
 
             today_label_html = (
                 "<span style='color:#999;font-size:10px;margin-right:4px;'>今走</span>"
@@ -866,7 +765,11 @@ def main():
         df_race = df
     render_race_info(selected_race, df_race)
 
-    all_cols = [c for c in df_race.columns if not c.endswith('_rank') and c not in ('先行順位', RACE_KEY_COL)]
+    all_cols = [
+        c for c in df_race.columns
+        if not c.endswith('_rank') and not c.endswith('_過去走由来')
+        and c not in ('先行順位', RACE_KEY_COL)
+    ]
     default_cols = [c for c in [
         '枠番', '馬番', '馬名', '騎手', '人気', '単オッズ', '推奨',
         '予想展開', '前走通過順', 'F指数', 'S指数', 'FU2',
@@ -915,23 +818,7 @@ def main():
                 st.caption("行をクリックすると、その馬の前走詳細がポップアップで表示されます。")
 
     with tab_tenkai:
-        prev_index_map = None
-        if drive_configured() and PREV_RACE_ID_COL in df_race.columns:
-            show_prev = st.checkbox(
-                "前走時点の指数も表示する（Google Drive・初回は数秒かかります）",
-            )
-            if show_prev:
-                root_id = st.secrets["DRIVE_ROOT_FOLDER_ID"]
-                ids_tuple = tuple(sorted({
-                    str(v).strip() for v in df_race[PREV_RACE_ID_COL]
-                    if pd.notna(v) and str(v).strip()
-                }))
-                try:
-                    with st.spinner("Google Driveから前走指数を取得中..."):
-                        prev_index_map = cached_prev_indices_for_race(root_id, ids_tuple)
-                except Exception as e:
-                    st.warning(f"Google Driveからの取得に失敗しました: {e}")
-        render_tenkai_view(df_race, prev_index_map)
+        render_tenkai_view(df_race)
 
 if __name__ == "__main__":
     main()
