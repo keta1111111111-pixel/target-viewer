@@ -13,10 +13,12 @@ st.set_page_config(page_title="TARGET 指数＆展開予測ビューア", page_i
 
 TARGET_INDICES = ['F指数', 'S指数', 'FU2']
 
+# TARGET本体の指数順位ハイライト（黄・水・緑）になるべく近づけた、
+# 純色に近い彩度の高い配色。
 RANK_COLORS = {
     1: ("#ffff00", "#000000"),  # 1位: 黄
-    2: ("#66ccff", "#000000"),  # 2位: 水
-    3: ("#66ff66", "#000000"),  # 3位: 緑
+    2: ("#00ffff", "#000000"),  # 2位: 水
+    3: ("#00ff00", "#000000"),  # 3位: 緑
 }
 
 # JRA公式の枠番カラー（1〜8枠）
@@ -31,11 +33,9 @@ WAKU_COLORS = {
     8: ("#e4007f", "#ffffff"),  # 桃
 }
 
-ROW_TAG_COLORS = {
-    'recommend': "#E2EFDA",
-    'nige': "#FFE6CC",
-    'senkou': "#FFF2CC",
-}
+# 出馬表で「信頼できる先行馬」（展開予想図の🔥アイコンと同じ判定基準）の
+# 行全体をハイライトする背景色。
+RELIABLE_ROW_COLOR = "#E2EFDA"
 
 CATEGORY_COLORS = {
     "逃げ": "#b30000", "先行": "#cc7a00", "先差": "#338066",
@@ -288,6 +288,12 @@ def render_race_info(race_meta, df_race: pd.DataFrame, race_options=None):
     if prev_race is not None:
         if col_prev.button("◀ 前R", key=f"prevrace_{race_meta['key']}", use_container_width=True):
             st.session_state['selected_race_key'] = prev_race['key']
+            # render_race_infoが呼ばれた時点でdf_race等は既にこの回の
+            # session_state（変更前の値）を元に計算済みのため、ここで
+            # session_stateを更新しただけでは同じ実行内には反映されない
+            # （ボタンを2回押さないと切り替わらないように見える不具合の原因）。
+            # st.rerun()で即座に再実行し、更新後のレースを反映させる。
+            st.rerun()
     else:
         col_prev.button("◀ 前R", key=f"prevrace_disabled_{race_meta['key']}",
                          disabled=True, use_container_width=True)
@@ -297,6 +303,7 @@ def render_race_info(race_meta, df_race: pd.DataFrame, race_options=None):
     if next_race is not None:
         if col_next.button("次R ▶", key=f"nextrace_{race_meta['key']}", use_container_width=True):
             st.session_state['selected_race_key'] = next_race['key']
+            st.rerun()
     else:
         col_next.button("次R ▶", key=f"nextrace_disabled_{race_meta['key']}",
                          disabled=True, use_container_width=True)
@@ -540,18 +547,18 @@ def style_dataframe(display_df: pd.DataFrame, full_df: pd.DataFrame):
     full_reset = full_df.reset_index(drop=True)
 
     def row_style(row):
+        # 「信頼できる先行馬」（展開予想図の🔥アイコンと同じ基準：予想展開が
+        # 逃げ・先行で、かつ脚質安定性が安定/やや不安定）の行をハイライトする。
+        # 過去走データ（決手）が無いCSV（旧形式）では判定できないため、
+        # その場合は何もハイライトしない。
         idx = row.name
-        rec = full_reset.loc[idx, '推奨'] if '推奨' in full_reset.columns else ''
+        is_reliable = False
         pos = full_reset.loc[idx, '予想展開'] if '予想展開' in full_reset.columns else ''
-        tag = None
-        if rec in ['先行妙味', '末脚妙味']:
-            tag = 'recommend'
-        elif pos == '逃げ':
-            tag = 'nige'
-        elif pos == '先行':
-            tag = 'senkou'
-        if tag:
-            return [f'background-color:{ROW_TAG_COLORS[tag]};'] * len(row)
+        if pos in ('逃げ', '先行') and past_race_col('決手', 1) in full_reset.columns:
+            stability = compute_style_stability(full_reset.loc[idx])
+            is_reliable = stability['label'] in ('安定', 'やや不安定')
+        if is_reliable:
+            return [f'background-color:{RELIABLE_ROW_COLOR};'] * len(row)
         return [''] * len(row)
 
     styler = display_df.style.apply(row_style, axis=1)
