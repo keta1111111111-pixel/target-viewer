@@ -144,6 +144,19 @@ def check_password() -> bool:
 def has_race_columns(df: pd.DataFrame) -> bool:
     return '場所' in df.columns and race_number_col(df) is not None
 
+def drop_header_leak_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """出馬表CSVには、レースの区切りを示すヘッダー行がそのままデータとして
+    紛れ込むことがある（例：「場所」列の値が文字列「場所」、「Ｒ」列の値が
+    文字列「Ｒ」になっている）。そのような行は実在のレース・馬ではないため
+    取り除く。"""
+    if '場所' not in df.columns:
+        return df
+    mask = df['場所'] != '場所'
+    r_col = race_number_col(df)
+    if r_col:
+        mask &= df[r_col] != r_col
+    return df[mask].reset_index(drop=True)
+
 def get_race_key(df: pd.DataFrame) -> pd.Series:
     """出馬表1行ごとに、どのレースに属するかを表すキーを返す。
     「場所」「Ｒ」列が無いCSV（旧形式）の場合は全行を1つのレース扱いにする。"""
@@ -166,7 +179,8 @@ def build_race_options(df: pd.DataFrame):
             'key': key,
             '場所': first.get('場所', ''),
             'Ｒ': first.get(r_col, ''),
-            'レース名': first.get('レース名', ''),
+            # 「レース名」列が無いCSV（新形式）では「略レース名」を使う
+            'レース名': first_nonempty(first, ['レース名', '略レース名']) or '',
             '発走時刻': first.get('発走時刻', ''),
             '芝ダ': first.get('芝ダ', ''),
             '距離': first.get('距離', ''),
@@ -399,6 +413,7 @@ def normalize_today_columns(df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def load_main_csv(file_bytes) -> pd.DataFrame:
     df = pd.read_csv(file_bytes, dtype=str, encoding="cp932")
+    df = drop_header_leak_rows(df)
     df = normalize_today_columns(df)
     df = calc_position_and_patterns(df)
     return df
@@ -735,24 +750,26 @@ def compute_index_trend(row: pd.Series, idx_name: str, num_walks: int = RECENT_W
 
 def compute_pace_forecast(df: pd.DataFrame):
     """レース全体の予想展開から、信頼できる（脚質安定性が安定/やや不安定の）
-    逃げ・先行馬の頭数を数え、レースのペースを予想する。"""
-    reliable = []
+    逃げ・先行馬の頭数を数え、レースのペースを予想する。
+    reliable_umabanには該当馬の馬番（文字列）を入れる
+    （カード側で該当馬をアイコン表示するために使う）。"""
+    reliable_umaban = set()
     for _, row in df.iterrows():
         pos = row.get('予想展開', '')
         if pos not in ('逃げ', '先行'):
             continue
         stability = compute_style_stability(row)
         if stability['label'] in ('安定', 'やや不安定'):
-            reliable.append(f"{row.get('馬番', '')}{row.get('馬名', '')}")
+            reliable_umaban.add(str(row.get('馬番', '')).strip())
 
-    n = len(reliable)
+    n = len(reliable_umaban)
     if n <= 1:
         label = 'スロー想定'
     elif n == 2:
         label = 'ミドル想定'
     else:
         label = 'ハイ想定'
-    return {'label': label, 'reliable_front_runners': reliable}
+    return {'label': label, 'reliable_umaban': reliable_umaban}
 
 def _has_past_index_cols(columns, walk_no: int = 1) -> bool:
     col_set = set(columns)
@@ -838,6 +855,37 @@ def render_style_analysis_section(row: pd.Series):
                 f"（{trend['pct_change']:+.0%} {arrow}{trend['label']}）"
             )
 
+def build_card_analysis_html(row: pd.Series) -> str:
+    """展開予想図カード用に、脚質安定性・好走時の脚質・指数推移をコンパクトな
+    1〜2行にまとめる（馬詳細ダイアログの「脚質・指数の分析」の簡略版）。
+    過去走データが無ければ空文字を返す。"""
+    if past_race_col('決手', 1) not in row.index:
+        return ""
+
+    stability = compute_style_stability(row)
+    stability_text = stability['label']
+    if stability['mode']:
+        stability_text += f"({stability['mode']})"
+
+    good = compute_good_run_style(row)
+    good_text = f"好走:{good['mode']}" if good else "好走データ不足"
+
+    trend_parts = []
+    for idx_name in TENKAI_BADGE_ORDER:
+        trend = compute_index_trend(row, idx_name)
+        if trend is None:
+            continue
+        arrow = INDEX_TREND_ARROWS[trend['label']]
+        trend_parts.append(f"{PREV_LABEL_SHORT[idx_name]}{arrow}")
+    trend_text = " ".join(trend_parts) if trend_parts else "-"
+
+    return (
+        "<div style='padding:0 6px 6px;color:#bbb;font-size:10px;line-height:1.6;'>"
+        f"脚質: {stability_text} / {good_text}<br>"
+        f"指数推移: {trend_text}"
+        "</div>"
+    )
+
 @st.dialog("馬詳細")
 def show_horse_detail_dialog(row: pd.Series):
     """出馬表の行をクリックした際に、スクロール不要でその場にポップアップ表示する。"""
@@ -857,21 +905,18 @@ def render_tenkai_view(df: pd.DataFrame):
         unsafe_allow_html=True,
     )
 
-    if past_race_col('決手', 1) in df.columns:
-        pace = compute_pace_forecast(df)
-        runners_note = (
-            f"（信頼できる先行馬：{', '.join(pace['reliable_front_runners'])}）"
-            if pace['reliable_front_runners'] else "（信頼できる先行馬なし）"
-        )
+    has_style_data = past_race_col('決手', 1) in df.columns
+    pace = compute_pace_forecast(df) if has_style_data else None
+    if pace is not None:
         st.markdown(
             f"<div style='background:#1a1a2e;color:white;font-weight:bold;"
             f"padding:8px 12px;border-radius:6px;margin-bottom:10px;'>"
-            f"推定ペース：{pace['label']}{runners_note}</div>",
+            f"推定ペース：{pace['label']}"
+            f"（🔥＝信頼できる先行馬）</div>",
             unsafe_allow_html=True,
         )
 
     df_sorted = df.sort_values(by='先行スコア', ascending=False)
-    show_prev = _has_past_index_cols(df.columns)
 
     for cat in CATEGORY_ORDER:
         cat_color = CATEGORY_COLORS[cat]
@@ -926,54 +971,23 @@ def render_tenkai_view(df: pd.DataFrame):
             else:
                 waku_badge = ""
 
-            prev_html = ""
-            if show_prev:
-                prev_badges = []
-                for label in TENKAI_BADGE_ORDER:
-                    name_short = PREV_LABEL_SHORT[label]
-                    info = get_past_index_info(row, label, walk_no=1)
-                    if info is None:
-                        prev_badges.append(
-                            "<span style='display:inline-block;min-width:40px;text-align:center;"
-                            "background:#111;color:white;border:1px solid #444;"
-                            "border-radius:3px;padding:2px 5px;font-size:11px;margin-right:2px;'>-</span>"
-                        )
-                        continue
-                    text = f"{name_short} {info['value']}"
-                    if info['rank'] in RANK_COLORS:
-                        bg, fg = RANK_COLORS[info['rank']]
-                        prev_badges.append(
-                            f"<span style='display:inline-block;min-width:40px;text-align:center;"
-                            f"background:{bg};color:{fg};border:1px solid #444;"
-                            f"border-radius:3px;padding:2px 5px;font-size:11px;"
-                            f"margin-right:2px;'>{text}</span>"
-                        )
-                    else:
-                        prev_badges.append(
-                            "<span style='display:inline-block;min-width:40px;text-align:center;"
-                            "background:#111;color:white;border:1px solid #444;"
-                            f"border-radius:3px;padding:2px 5px;font-size:11px;"
-                            f"margin-right:2px;'>{text}</span>"
-                        )
-                prev_html = (
-                    "<div style='padding:0 6px 6px;color:#999;font-size:10px;'>"
-                    "<span style='margin-right:4px;'>前走</span>"
-                    + "".join(prev_badges) + "</div>"
-                )
-
-            today_label_html = (
-                "<span style='color:#999;font-size:10px;margin-right:4px;'>今走</span>"
-                if prev_html else ""
+            # 信頼できる（脚質が安定した）逃げ・先行馬には馬名の横にアイコンを付ける
+            is_reliable = (
+                pace is not None
+                and str(row.get('馬番', '')).strip() in pace['reliable_umaban']
             )
+            reliable_icon = " 🔥" if is_reliable else ""
+
+            analysis_html = build_card_analysis_html(row) if has_style_data else ""
 
             cards_html += (
                 "<div style='background:#2a1a1a;border:1px solid #555;border-radius:4px;"
                 "min-width:160px;max-width:200px;'>"
                 f"<div style='background:{cat_color};color:white;font-weight:bold;"
-                f"font-size:12px;padding:3px 6px;'>{waku_badge}{row.get('馬番', '')} {row.get('馬名', '')}</div>"
+                f"font-size:12px;padding:3px 6px;'>{waku_badge}{row.get('馬番', '')} {row.get('馬名', '')}{reliable_icon}</div>"
                 f"<div style='color:lightgray;font-size:11px;padding:3px 6px;'>前走: {pass_str}</div>"
-                f"<div style='padding:3px 6px 6px;'>{today_label_html}{badges_html}</div>"
-                f"{prev_html}"
+                f"<div style='padding:3px 6px 6px;'>{badges_html}</div>"
+                f"{analysis_html}"
                 "</div>"
             )
         cards_html += "</div>"
@@ -1040,17 +1054,20 @@ def render_recent_races_tab(df_race: pd.DataFrame):
         return
 
     def highlight_row(r):
+        # rはdisplay_df（「同コース」列を除いた列数）の行として渡されるため、
+        # 判定に必要な値は元のhist_dfをインデックスで引いて取得する
+        # （返すスタイル配列の長さはrの列数=display_dfの列数に合わせる）。
+        idx = r.name
         style = ''
-        if r['同コース']:
+        if hist_df.loc[idx, '同コース']:
             style += 'background-color:#fff3cd;'
-        if r['着順'] is not None and r['着順'] <= GOOD_FINISH_THRESHOLD:
+        finish = hist_df.loc[idx, '着順']
+        if finish is not None and finish <= GOOD_FINISH_THRESHOLD:
             style += 'font-weight:bold;color:#1a53ff;'
         return [style] * len(r)
 
     display_df = hist_df.drop(columns=['同コース'])
-    styler = display_df.style.apply(
-        lambda r: highlight_row(hist_df.loc[r.name]), axis=1
-    )
+    styler = display_df.style.apply(highlight_row, axis=1)
     st.caption("背景色＝今走と同コース（場所・芝ダート・距離が完全一致） / 太字青字＝3着以内")
     st.dataframe(styler, use_container_width=True, hide_index=True)
 
