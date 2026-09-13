@@ -193,17 +193,24 @@ def build_race_options(df: pd.DataFrame):
     return rows
 
 def render_race_selector(race_options):
-    """場所ごとにグループ化した「1R」「2R」…ボタンでレースを選ばせ、
-    選択中のレースのメタ情報（dict）を返す。race_options が空/Noneなら None。"""
+    """場所ごとにグループ化した「1R」「2R」…のピル（st.pillsウィジェット）で
+    レースを選ばせ、選択中のレースのメタ情報（dict）を返す。
+    以前はst.columns+st.buttonで組んだグリッドをCSSでスマホ幅用に折り返す
+    方式だったが、Streamlit内部がこのブロックをスマホ幅で縦積みにする挙動を
+    CSSで確実に上書きするのが難しく、実機（スマホのポートレート表示）では
+    改善しなかった。st.pillsはそもそも折り返し表示に対応したStreamlit標準
+    ウィジェットなので、CSSに頼らずスマホでも崩れずに並ぶ。
+    race_options が空/Noneなら None。"""
     if not race_options:
         return None
-
-    st.markdown(RACE_SELECTOR_MOBILE_CSS, unsafe_allow_html=True)
 
     by_key = {r['key']: r for r in race_options}
 
     if st.session_state.get('selected_race_key') not in by_key:
         st.session_state['selected_race_key'] = race_options[0]['key']
+
+    current_key = st.session_state['selected_race_key']
+    current_race = by_key[current_key]
 
     venues = []
     races_by_venue = {}
@@ -214,7 +221,6 @@ def render_race_selector(race_options):
             venues.append(venue)
         races_by_venue[venue].append(r)
 
-    cols_per_row = 6
     for venue in venues:
         st.markdown(
             f"<div style='border-left:4px solid #2e7d32;padding-left:8px;"
@@ -222,18 +228,25 @@ def render_race_selector(race_options):
             unsafe_allow_html=True,
         )
         races = sorted(races_by_venue[venue], key=lambda r: safe_float(r['Ｒ'], 0) or 0)
-        for start in range(0, len(races), cols_per_row):
-            chunk = races[start:start + cols_per_row]
-            cols = st.columns(cols_per_row)
-            for col, r in zip(cols, chunk):
-                is_selected = r['key'] == st.session_state['selected_race_key']
-                if col.button(
-                    f"{r['Ｒ']}R",
-                    key=f"racebtn_{r['key']}",
-                    type="primary" if is_selected else "secondary",
-                    use_container_width=True,
-                ):
-                    st.session_state['selected_race_key'] = r['key']
+        labels = [f"{r['Ｒ']}R" for r in races]
+        label_to_key = {label: r['key'] for label, r in zip(labels, races)}
+
+        pills_key = f"pills_{venue}"
+        # st.pillsは自身のkeyに紐づくsession_stateで選択状態を保持するため、
+        # 描画の直前にこちら（selected_race_key）の状態を反映させておく。
+        # こうしないと「別の開催のレースを選んだ後もこの開催のピルが
+        # 選択済みのままに見える」というズレが起きる。
+        st.session_state[pills_key] = (
+            f"{current_race['Ｒ']}R" if current_race['場所'] == venue else None
+        )
+        selected_label = st.pills(
+            venue, options=labels, key=pills_key, label_visibility="collapsed",
+        )
+        if selected_label is not None:
+            new_key = label_to_key[selected_label]
+            if new_key != current_key:
+                st.session_state['selected_race_key'] = new_key
+                st.rerun()
 
     return by_key[st.session_state['selected_race_key']]
 
@@ -1016,34 +1029,6 @@ def _reliable_icon_html(fire_count: int) -> str:
 
 RELIABLE_ICON_STRONG_HTML = _reliable_icon_html(2)  # 脚質安定性「安定」
 RELIABLE_ICON_WEAK_HTML = _reliable_icon_html(1)    # 脚質安定性「やや不安定」
-
-# スマホなど狭い画面でもレース選択ボタンが縦に間延びしないよう、
-# st.columns による横並びブロックを強制的に折り返しグリッドにするCSS。
-RACE_SELECTOR_MOBILE_CSS = """
-<style>
-@media (max-width: 640px) {
-    div[data-testid="stHorizontalBlock"] {
-        /* Streamlitはスマホ幅でこのブロックを flex-direction: column に
-           切り替えて縦積みにする（前回はflex-wrapしか上書きしておらず、
-           この行が無かったため効果が無かった）。rowに戻した上で
-           折り返しグリッドにする。 */
-        flex-direction: row !important;
-        flex-wrap: wrap !important;
-        gap: 4px !important;
-    }
-    div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
-        flex: 1 1 22% !important;
-        width: 22% !important;
-        min-width: 60px !important;
-    }
-    div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] button {
-        padding: 2px 4px !important;
-        font-size: 12px !important;
-        min-height: 32px !important;
-    }
-}
-</style>
-"""
 
 def render_tenkai_view(df: pd.DataFrame):
     st.markdown(
