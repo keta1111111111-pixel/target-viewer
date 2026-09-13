@@ -196,6 +196,8 @@ def render_race_selector(race_options):
     if not race_options:
         return None
 
+    st.markdown(RACE_SELECTOR_MOBILE_CSS, unsafe_allow_html=True)
+
     by_key = {r['key']: r for r in race_options}
 
     if st.session_state.get('selected_race_key') not in by_key:
@@ -856,8 +858,9 @@ def render_style_analysis_section(row: pd.Series):
             )
 
 def build_card_analysis_html(row: pd.Series) -> str:
-    """展開予想図カード用に、脚質安定性・好走時の脚質・指数推移をコンパクトな
-    1〜2行にまとめる（馬詳細ダイアログの「脚質・指数の分析」の簡略版）。
+    """展開予想図カード用に、脚質安定性・好走時の脚質をコンパクトな1行に
+    まとめる（馬詳細ダイアログの「脚質・指数の分析」の簡略版）。
+    指数推移は今走バッジの横に矢印で表示するため、ここには含めない。
     過去走データが無ければ空文字を返す。"""
     if past_race_col('決手', 1) not in row.index:
         return ""
@@ -870,19 +873,9 @@ def build_card_analysis_html(row: pd.Series) -> str:
     good = compute_good_run_style(row)
     good_text = f"好走:{good['mode']}" if good else "好走データ不足"
 
-    trend_parts = []
-    for idx_name in TENKAI_BADGE_ORDER:
-        trend = compute_index_trend(row, idx_name)
-        if trend is None:
-            continue
-        arrow = INDEX_TREND_ARROWS[trend['label']]
-        trend_parts.append(f"{PREV_LABEL_SHORT[idx_name]}{arrow}")
-    trend_text = " ".join(trend_parts) if trend_parts else "-"
-
     return (
         "<div style='padding:0 6px 6px;color:#bbb;font-size:10px;line-height:1.6;'>"
-        f"脚質: {stability_text} / {good_text}<br>"
-        f"指数推移: {trend_text}"
+        f"脚質: {stability_text} / {good_text}"
         "</div>"
     )
 
@@ -897,6 +890,37 @@ def show_horse_detail_dialog(row: pd.Series):
 PREV_LABEL_SHORT = {'FU2': 'FU2', 'S指数': 'S', 'F指数': 'F'}
 # 展開予想図カードでのバッジ表示順（今走・前走とも共通。位置を揃えるため同じ順序を使う）
 TENKAI_BADGE_ORDER = ['FU2', 'S指数', 'F指数']
+
+# 信頼できる先行馬アイコン。カードのヘッダー背景色（脚質カテゴリごとに異なる）に
+# 対しても視認できるよう、白背景の丸バッジで包んで常に目立たせる。
+RELIABLE_ICON_HTML = (
+    "<span style='background:#fff;border-radius:50%;display:inline-block;"
+    "line-height:1;padding:1px 3px;font-size:10px;margin-left:3px;"
+    "box-shadow:0 0 0 1px #333;'>🔥</span>"
+)
+
+# スマホなど狭い画面でもレース選択ボタンが縦に間延びしないよう、
+# st.columns による横並びブロックを強制的に折り返しグリッドにするCSS。
+RACE_SELECTOR_MOBILE_CSS = """
+<style>
+@media (max-width: 640px) {
+    div[data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap !important;
+        gap: 4px !important;
+    }
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+        flex: 1 1 22% !important;
+        width: 22% !important;
+        min-width: 60px !important;
+    }
+    div[data-testid="stHorizontalBlock"] div[data-testid="stButton"] button {
+        padding: 2px 4px !important;
+        font-size: 12px !important;
+        min-height: 32px !important;
+    }
+}
+</style>
+"""
 
 def render_tenkai_view(df: pd.DataFrame):
     st.markdown(
@@ -953,7 +977,9 @@ def render_tenkai_view(df: pd.DataFrame):
                     continue
                 r = int(rank) if pd.notna(rank) else 99
                 bg_c, fg_c = RANK_COLORS.get(r, ("#111111", "white"))
-                label = f"{name_short} {val}"
+                trend = compute_index_trend(row, idx_name) if has_style_data else None
+                arrow = INDEX_TREND_ARROWS[trend['label']] if trend else ""
+                label = f"{name_short} {val}{arrow}"
                 badges_html += (
                     f"<span style='display:inline-block;min-width:40px;text-align:center;"
                     f"background:{bg_c};color:{fg_c};border:1px solid #444;"
@@ -976,7 +1002,7 @@ def render_tenkai_view(df: pd.DataFrame):
                 pace is not None
                 and str(row.get('馬番', '')).strip() in pace['reliable_umaban']
             )
-            reliable_icon = " 🔥" if is_reliable else ""
+            reliable_icon = f" {RELIABLE_ICON_HTML}" if is_reliable else ""
 
             analysis_html = build_card_analysis_html(row) if has_style_data else ""
 
@@ -996,11 +1022,27 @@ def render_tenkai_view(df: pd.DataFrame):
 # ==========================================================
 # 近走成績（過去N走を表形式で一覧表示）
 # ==========================================================
+def _numeric_or_original(series: pd.Series) -> pd.Series:
+    """列の大半の値が数値に変換できる場合は数値型（整数のみならInt64）に
+    変換して返す。そうでなければ元のSeriesをそのまま返す。
+    dtype=strで読み込んだ列や、'-'を欠損として含む列を、表の列見出し
+    クリックでの並べ替えが文字列比較（「10」が「2」より前に来る等）に
+    ならないようにするために使う。"""
+    converted = pd.to_numeric(series, errors='coerce')
+    as_str = series.astype(str).str.strip()
+    non_empty = series.notna() & (as_str != '') & (as_str != '-')
+    if non_empty.sum() > 0 and converted.notna().sum() >= non_empty.sum() * 0.9:
+        if (converted.dropna() % 1 == 0).all():
+            return converted.astype('Int64')
+        return converted
+    return series
+
 def build_recent_races_table(row: pd.Series, num_walks: int):
-    """指定した馬の直近num_walks走を、古い→新しい順のDataFrameにまとめる。
-    レース名が取得できない走（データが無い）はスキップする。"""
+    """指定した馬の直近num_walks走を、新しい→古い順（1走前が先頭）の
+    DataFrameにまとめる。レース名が取得できない走（データが無い）は
+    スキップする。"""
     records = []
-    for walk_no in range(num_walks, 0, -1):
+    for walk_no in range(1, num_walks + 1):
         race_name = get_walk_race_name(row, walk_no)
         if race_name is None:
             continue
@@ -1023,7 +1065,11 @@ def build_recent_races_table(row: pd.Series, num_walks: int):
             'F指数': info_f['value'] if info_f else '-',
             '同コース': is_same_course(row, walk_no),
         })
-    return pd.DataFrame(records)
+    hist_df = pd.DataFrame(records)
+    for col in ('FU2', 'S指数', 'F指数', '距離'):
+        if col in hist_df.columns:
+            hist_df[col] = _numeric_or_original(hist_df[col])
+    return hist_df
 
 def render_recent_races_tab(df_race: pd.DataFrame):
     """選択した馬の過去走を表形式で一覧表示する
@@ -1068,8 +1114,33 @@ def render_recent_races_tab(df_race: pd.DataFrame):
 
     display_df = hist_df.drop(columns=['同コース'])
     styler = display_df.style.apply(highlight_row, axis=1)
+    # FU2/S指数/F指数/距離は並べ替えを数値として行うためInt64/float型に
+    # 変換済み（_numeric_or_original）。データが無い走はNA（<NA>表示）に
+    # なってしまうため、表示上は元通り「-」に戻す。
+    na_fallback_cols = [c for c in ('FU2', 'S指数', 'F指数', '距離') if c in display_df.columns]
+    if na_fallback_cols:
+        styler = styler.format({c: lambda v: '-' if pd.isna(v) else v for c in na_fallback_cols})
     st.caption("背景色＝今走と同コース（場所・芝ダート・距離が完全一致） / 太字青字＝3着以内")
     st.dataframe(styler, use_container_width=True, hide_index=True)
+
+def render_horse_quick_select(df_race: pd.DataFrame, race_key):
+    """馬名ボタンをクリックすると、その馬の前走詳細をポップアップ表示する。
+    （出馬表テーブルの行選択チェックボックス操作の代わりに、直接クリックで
+    開けるようにするためのUI。race_keyはボタンのkeyをレースごとに一意に
+    するために使う。）"""
+    rows = df_race.reset_index(drop=True)
+    if rows.empty:
+        return
+
+    st.caption("馬名をクリックすると、その馬の前走詳細がポップアップで表示されます。")
+    cols_per_row = 6
+    for start in range(0, len(rows), cols_per_row):
+        chunk = rows.iloc[start:start + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for col, (i, row) in zip(cols, chunk.iterrows()):
+            label = f"{row.get('馬番', '')} {row.get('馬名', '')}"
+            if col.button(label, key=f"horsebtn_{race_key}_{i}", use_container_width=True):
+                show_horse_detail_dialog(row)
 
 # ==========================================================
 # メイン
@@ -1147,32 +1218,16 @@ def main():
             # （ヘッダー約38px＋1行約35px、Streamlitのデータフレーム標準の目安）。
             table_height = 38 + 35 * len(display_df) + 3
 
-            event = st.dataframe(
+            st.dataframe(
                 styler,
                 use_container_width=True,
                 hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
                 height=table_height,
             )
 
-            selected_rows = event.selection.rows if event and event.selection else []
-            if selected_rows:
-                # 展開予想図タブのチェックボックス操作など、この選択と無関係な
-                # 再実行でも出馬表の選択状態は保持され続けるため、そのままだと
-                # 毎回ポップアップが再度開いてしまう。同じ選択に対しては
-                # 一度だけ開くようにする。
-                selection_signature = (
-                    selected_race['key'] if selected_race else None,
-                    tuple(selected_rows),
-                )
-                if st.session_state.get('_last_shown_selection') != selection_signature:
-                    st.session_state['_last_shown_selection'] = selection_signature
-                    full_row = df_race.reset_index(drop=True).iloc[selected_rows[0]]
-                    show_horse_detail_dialog(full_row)
-            else:
-                st.session_state['_last_shown_selection'] = None
-                st.caption("行をクリックすると、その馬の前走詳細がポップアップで表示されます。")
+            # チェックボックスでの行選択ではなく、馬名ボタンのクリックで
+            # 詳細ポップアップを開けるようにする。
+            render_horse_quick_select(df_race, selected_race['key'] if selected_race else None)
 
     with tab_tenkai:
         render_tenkai_view(df_race)
