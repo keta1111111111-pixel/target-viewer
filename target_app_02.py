@@ -206,8 +206,13 @@ def render_race_selector(race_options):
 
     by_key = {r['key']: r for r in race_options}
 
+    force_sync = st.session_state.pop('_force_pill_sync', False)
+
     if st.session_state.get('selected_race_key') not in by_key:
         st.session_state['selected_race_key'] = race_options[0]['key']
+        # 初回描画時は、選択中レースの開催のピルにも初期選択状態を反映させる
+        # 必要があるため、同期を強制する。
+        force_sync = True
 
     current_key = st.session_state['selected_race_key']
     current_race = by_key[current_key]
@@ -233,19 +238,26 @@ def render_race_selector(race_options):
 
         pills_key = f"pills_{venue}"
         # st.pillsは自身のkeyに紐づくsession_stateで選択状態を保持するため、
-        # 描画の直前にこちら（selected_race_key）の状態を反映させておく。
-        # こうしないと「別の開催のレースを選んだ後もこの開催のピルが
-        # 選択済みのままに見える」というズレが起きる。
-        st.session_state[pills_key] = (
-            f"{current_race['Ｒ']}R" if current_race['場所'] == venue else None
-        )
+        # 「前R/次Rボタン」など他の操作でselected_race_keyが変わった直後
+        # （force_sync時）だけ、描画の直前にこちら（selected_race_key）の
+        # 状態を反映させる。毎回無条件に上書きすると、ユーザーがまさに今
+        # クリックしたピルの新しい選択値（Streamlitがsession_stateに
+        # 反映済みのもの）を描画前に古い値で潰してしまい、ピルをクリック
+        # してもレースが切り替わらない不具合になる。
+        if force_sync:
+            st.session_state[pills_key] = (
+                f"{current_race['Ｒ']}R" if current_race['場所'] == venue else None
+            )
         selected_label = st.pills(
             venue, options=labels, key=pills_key, label_visibility="collapsed",
         )
-        if selected_label is not None:
-            new_key = label_to_key[selected_label]
-            if new_key != current_key:
+        if not force_sync and selected_label is not None:
+            new_key = label_to_key.get(selected_label)
+            if new_key is not None and new_key != current_key:
                 st.session_state['selected_race_key'] = new_key
+                # 次の再実行では、この開催のピルは今回のクリック結果のまま
+                # でよいが、他の開催のピルは選択解除に同期させる必要がある。
+                st.session_state['_force_pill_sync'] = True
                 st.rerun()
 
     return by_key[st.session_state['selected_race_key']]
@@ -303,6 +315,10 @@ def render_race_info(race_meta, df_race: pd.DataFrame, race_options=None):
     if prev_race is not None:
         if col_prev.button("◀ 前R", key=f"prevrace_{race_meta['key']}", use_container_width=True):
             st.session_state['selected_race_key'] = prev_race['key']
+            # render_race_selector側のピル（st.pills）のsession_stateは
+            # この操作では更新されないため、次の再実行でピルの選択状態も
+            # 新しいレースに合わせて同期させる必要があることを伝えておく。
+            st.session_state['_force_pill_sync'] = True
             # render_race_infoが呼ばれた時点でdf_race等は既にこの回の
             # session_state（変更前の値）を元に計算済みのため、ここで
             # session_stateを更新しただけでは同じ実行内には反映されない
@@ -318,6 +334,7 @@ def render_race_info(race_meta, df_race: pd.DataFrame, race_options=None):
     if next_race is not None:
         if col_next.button("次R ▶", key=f"nextrace_{race_meta['key']}", use_container_width=True):
             st.session_state['selected_race_key'] = next_race['key']
+            st.session_state['_force_pill_sync'] = True
             st.rerun()
     else:
         col_next.button("次R ▶", key=f"nextrace_disabled_{race_meta['key']}",
