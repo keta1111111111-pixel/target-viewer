@@ -466,11 +466,9 @@ def load_main_csv(file_bytes) -> pd.DataFrame:
     df = drop_header_leak_rows(df)
     df = normalize_today_columns(df)
     df = calc_position_and_patterns(df)
-    # 過去走データが無いCSV（旧形式）ではcompute_same_course_good_runが
-    # 常にFalseを返すだけなので、常に計算して問題ない。
-    df['同コース好走'] = df.apply(
-        lambda row: '◎' if compute_same_course_good_run(row) else '', axis=1
-    )
+    # 過去走データが無いCSV（旧形式）ではget_same_course_markが常に空文字を
+    # 返すだけなので、常に計算して問題ない。
+    df['同コース好走'] = df.apply(get_same_course_mark, axis=1)
     return df
 
 def parse_index_id(id_str) -> tuple:
@@ -599,7 +597,11 @@ def style_dataframe(display_df: pd.DataFrame, full_df: pd.DataFrame):
 
     if '同コース好走' in display_df.columns:
         def highlight_same_course_good_run(s):
-            return ['background-color:#fff3cd; font-weight:bold;' if v == '◎' else '' for v in s]
+            styles = []
+            for v in s:
+                color = SAME_COURSE_MARK_COLORS.get(v)
+                styles.append(f'background-color:{color}; font-weight:bold;' if color else '')
+            return styles
         styler = styler.apply(highlight_same_course_good_run, subset=['同コース好走'])
 
     if '単オッズ' in display_df.columns:
@@ -784,6 +786,44 @@ def compute_same_course_good_run(row: pd.Series, num_walks: int = EXTENDED_WALKS
         if finish is not None and finish <= GOOD_FINISH_THRESHOLD:
             return True
     return False
+
+def compute_same_course_win_count(row: pd.Series, num_walks: int = EXTENDED_WALKS) -> int:
+    """過去num_walks走の中で、今走と同コース（場所・芝ダート区分・距離が
+    完全一致）かつ1着（勝利）だった回数を返す。"""
+    count = 0
+    for walk_no in range(1, num_walks + 1):
+        if not is_same_course(row, walk_no):
+            continue
+        finish = get_walk_finish(row, walk_no)
+        if finish is not None and finish == 1:
+            count += 1
+    return count
+
+# 出馬表の「同コース好走」欄に表示するマーク。
+# 〇：同コースで3着以内の実績はあるが勝利（1着）は無い
+# ◎：同コースでの勝利（1着）が1回
+# ☆：同コースでの勝利（1着）が2回以上（複数回の勝利実績＝本当に得意）
+SAME_COURSE_MARK_GOOD = '〇'
+SAME_COURSE_MARK_WIN = '◎'
+SAME_COURSE_MARK_MULTI_WIN = '☆'
+SAME_COURSE_MARK_COLORS = {
+    SAME_COURSE_MARK_GOOD: '#fff3cd',
+    SAME_COURSE_MARK_WIN: '#ffe0a3',
+    SAME_COURSE_MARK_MULTI_WIN: '#ffd700',
+}
+
+def get_same_course_mark(row: pd.Series, num_walks: int = EXTENDED_WALKS) -> str:
+    """出馬表の「同コース好走」列に表示するマークを返す
+    （SAME_COURSE_MARK_*の優先順：☆ > ◎ > 〇）。
+    該当なし、または過去走データが無いCSV（旧形式）の場合は空文字を返す。"""
+    win_count = compute_same_course_win_count(row, num_walks)
+    if win_count >= 2:
+        return SAME_COURSE_MARK_MULTI_WIN
+    if win_count == 1:
+        return SAME_COURSE_MARK_WIN
+    if compute_same_course_good_run(row, num_walks):
+        return SAME_COURSE_MARK_GOOD
+    return ''
 
 # 指数推移で上昇/下降と判定する変化率のしきい値
 INDEX_TREND_THRESHOLD = 0.10
