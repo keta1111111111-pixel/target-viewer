@@ -235,8 +235,31 @@ def render_race_selector(race_options):
 
     return by_key[st.session_state['selected_race_key']]
 
-def render_race_info(race_meta, df_race: pd.DataFrame):
-    """選択中レースの発走時刻・レース名・距離・頭数などをまとめて表示する。"""
+def get_adjacent_races(race_options, current_key):
+    """現在選択中のレースと同じ開催（場所）内で、Ｒ番号順に見た前後の
+    レースのメタ情報を返す（prev_race, next_race）。該当が無ければ
+    その方はNone。"""
+    if not race_options or current_key is None:
+        return None, None
+    current = next((r for r in race_options if r['key'] == current_key), None)
+    if current is None:
+        return None, None
+    venue = current['場所']
+    same_venue = sorted(
+        (r for r in race_options if r['場所'] == venue),
+        key=lambda r: safe_float(r['Ｒ'], 0) or 0,
+    )
+    idx = next((i for i, r in enumerate(same_venue) if r['key'] == current_key), None)
+    if idx is None:
+        return None, None
+    prev_race = same_venue[idx - 1] if idx > 0 else None
+    next_race = same_venue[idx + 1] if idx < len(same_venue) - 1 else None
+    return prev_race, next_race
+
+def render_race_info(race_meta, df_race: pd.DataFrame, race_options=None):
+    """選択中レースの発走時刻・レース名・距離・頭数などをまとめて表示する。
+    race_optionsを渡すと、同じ開催内の前後のレースへ移動するボタンを
+    バナーの両端に表示する。"""
     if race_meta is None:
         return
 
@@ -253,12 +276,30 @@ def render_race_info(race_meta, df_race: pd.DataFrame):
         parts.append(f"{surface}{distance}m".strip())
     parts.append(f"{len(df_race)}頭")
 
-    st.markdown(
+    banner_html = (
         "<div style='background:#eef6ee;border:1px solid #cfe8cf;border-radius:8px;"
         "padding:10px 16px;font-size:17px;font-weight:bold;margin:4px 0 16px;'>"
-        + "　".join(parts) + "</div>",
-        unsafe_allow_html=True,
+        + "　".join(parts) + "</div>"
     )
+
+    prev_race, next_race = get_adjacent_races(race_options, race_meta.get('key'))
+    col_prev, col_mid, col_next = st.columns([1, 6, 1])
+
+    if prev_race is not None:
+        if col_prev.button("◀ 前R", key=f"prevrace_{race_meta['key']}", use_container_width=True):
+            st.session_state['selected_race_key'] = prev_race['key']
+    else:
+        col_prev.button("◀ 前R", key=f"prevrace_disabled_{race_meta['key']}",
+                         disabled=True, use_container_width=True)
+
+    col_mid.markdown(banner_html, unsafe_allow_html=True)
+
+    if next_race is not None:
+        if col_next.button("次R ▶", key=f"nextrace_{race_meta['key']}", use_container_width=True):
+            st.session_state['selected_race_key'] = next_race['key']
+    else:
+        col_next.button("次R ▶", key=f"nextrace_disabled_{race_meta['key']}",
+                         disabled=True, use_container_width=True)
 
 # ==========================================================
 # データ処理ロジック（既存アプリから移植・フレームワーク非依存）
@@ -418,6 +459,11 @@ def load_main_csv(file_bytes) -> pd.DataFrame:
     df = drop_header_leak_rows(df)
     df = normalize_today_columns(df)
     df = calc_position_and_patterns(df)
+    # 過去走データが無いCSV（旧形式）ではcompute_same_course_good_runが
+    # 常にFalseを返すだけなので、常に計算して問題ない。
+    df['同コース好走'] = df.apply(
+        lambda row: '◎' if compute_same_course_good_run(row) else '', axis=1
+    )
     return df
 
 def parse_index_id(id_str) -> tuple:
@@ -543,6 +589,11 @@ def style_dataframe(display_df: pd.DataFrame, full_df: pd.DataFrame):
                     styles.append('')
             return styles
         styler = styler.apply(highlight_waku, subset=['枠番'])
+
+    if '同コース好走' in display_df.columns:
+        def highlight_same_course_good_run(s):
+            return ['background-color:#fff3cd; font-weight:bold;' if v == '◎' else '' for v in s]
+        styler = styler.apply(highlight_same_course_good_run, subset=['同コース好走'])
 
     if '単オッズ' in display_df.columns:
         styler = styler.format({'単オッズ': lambda v: '' if pd.isna(v) else f'{v:.1f}'})
@@ -714,6 +765,18 @@ def compute_good_run_style(row: pd.Series, num_walks: int = EXTENDED_WALKS):
 
     mode_style = max(votes, key=votes.get)
     return {'mode': mode_style, 'count': votes[mode_style], 'good_total': good_total}
+
+def compute_same_course_good_run(row: pd.Series, num_walks: int = EXTENDED_WALKS) -> bool:
+    """過去num_walks走の中に、今走と同コース（場所・芝ダート区分・距離が
+    完全一致）かつ好走（3着以内）だった走があるかどうかを返す。
+    過去走データが無いCSV（旧形式）でもFalseを返すだけで例外にはならない。"""
+    for walk_no in range(1, num_walks + 1):
+        if not is_same_course(row, walk_no):
+            continue
+        finish = get_walk_finish(row, walk_no)
+        if finish is not None and finish <= GOOD_FINISH_THRESHOLD:
+            return True
+    return False
 
 # 指数推移で上昇/下降と判定する変化率のしきい値
 INDEX_TREND_THRESHOLD = 0.10
@@ -1191,7 +1254,7 @@ def main():
         df_race = df[df[RACE_KEY_COL] == selected_race['key']].reset_index(drop=True)
     else:
         df_race = df
-    render_race_info(selected_race, df_race)
+    render_race_info(selected_race, df_race, race_options)
 
     all_cols = [
         c for c in df_race.columns
@@ -1200,7 +1263,7 @@ def main():
     ]
     default_cols = [c for c in [
         '枠番', '馬番', '馬名', '騎手', '人気', '単オッズ', '推奨',
-        '予想展開', '前走通過順', 'F指数', 'S指数', 'FU2',
+        '予想展開', '前走通過順', '同コース好走', 'F指数', 'S指数', 'FU2',
     ] if c in all_cols]
 
     tab_table, tab_tenkai, tab_recent = st.tabs(["📋 出馬表", "🗺️ 展開予想図", "📖 近走成績"])
