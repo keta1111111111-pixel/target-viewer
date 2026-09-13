@@ -34,8 +34,10 @@ WAKU_COLORS = {
 }
 
 # 出馬表で「信頼できる先行馬」（展開予想図の🔥アイコンと同じ判定基準）の
-# 行全体をハイライトする背景色。
-RELIABLE_ROW_COLOR = "#E2EFDA"
+# 行全体をハイライトする背景色。脚質安定性が「安定」なら濃い方、
+# 「やや不安定」なら薄い方を使い、強弱を付ける。
+RELIABLE_ROW_COLOR_STRONG = "#A9D18E"  # 安定
+RELIABLE_ROW_COLOR_WEAK = "#E2EFDA"    # やや不安定
 
 CATEGORY_COLORS = {
     "逃げ": "#b30000", "先行": "#cc7a00", "先差": "#338066",
@@ -547,16 +549,17 @@ def style_dataframe(display_df: pd.DataFrame, full_df: pd.DataFrame):
     def row_style(row):
         # 「信頼できる先行馬」（展開予想図の🔥アイコンと同じ基準：予想展開が
         # 逃げ・先行で、かつ脚質安定性が安定/やや不安定）の行をハイライトする。
+        # 安定＝濃い色、やや不安定＝薄い色で強弱を付ける。
         # 過去走データ（決手）が無いCSV（旧形式）では判定できないため、
         # その場合は何もハイライトしない。
         idx = row.name
-        is_reliable = False
         pos = full_reset.loc[idx, '予想展開'] if '予想展開' in full_reset.columns else ''
         if pos in ('逃げ', '先行') and past_race_col('決手', 1) in full_reset.columns:
             stability = compute_style_stability(full_reset.loc[idx])
-            is_reliable = stability['label'] in ('安定', 'やや不安定')
-        if is_reliable:
-            return [f'background-color:{RELIABLE_ROW_COLOR};'] * len(row)
+            if stability['label'] == '安定':
+                return [f'background-color:{RELIABLE_ROW_COLOR_STRONG};'] * len(row)
+            if stability['label'] == 'やや不安定':
+                return [f'background-color:{RELIABLE_ROW_COLOR_WEAK};'] * len(row)
         return [''] * len(row)
 
     styler = display_df.style.apply(row_style, axis=1)
@@ -1003,11 +1006,16 @@ TENKAI_BADGE_ORDER = ['FU2', 'S指数', 'F指数']
 
 # 信頼できる先行馬アイコン。カードのヘッダー背景色（脚質カテゴリごとに異なる）に
 # 対しても視認できるよう、白背景の丸バッジで包んで常に目立たせる。
-RELIABLE_ICON_HTML = (
-    "<span style='background:#fff;border-radius:50%;display:inline-block;"
-    "line-height:1;padding:1px 3px;font-size:10px;margin-left:3px;"
-    "box-shadow:0 0 0 1px #333;'>🔥</span>"
-)
+# 脚質安定性が「安定」なら🔥🔥、「やや不安定」なら🔥で強弱を付ける。
+def _reliable_icon_html(fire_count: int) -> str:
+    return (
+        "<span style='background:#fff;border-radius:50%;display:inline-block;"
+        "line-height:1;padding:1px 3px;font-size:10px;margin-left:3px;"
+        f"box-shadow:0 0 0 1px #333;'>{'🔥' * fire_count}</span>"
+    )
+
+RELIABLE_ICON_STRONG_HTML = _reliable_icon_html(2)  # 脚質安定性「安定」
+RELIABLE_ICON_WEAK_HTML = _reliable_icon_html(1)    # 脚質安定性「やや不安定」
 
 # スマホなど狭い画面でもレース選択ボタンが縦に間延びしないよう、
 # st.columns による横並びブロックを強制的に折り返しグリッドにするCSS。
@@ -1046,7 +1054,7 @@ def render_tenkai_view(df: pd.DataFrame):
             f"<div style='background:#1a1a2e;color:white;font-weight:bold;"
             f"padding:8px 12px;border-radius:6px;margin-bottom:10px;'>"
             f"推定ペース：{pace['label']}"
-            f"（🔥＝信頼できる先行馬）</div>",
+            f"（🔥🔥＝信頼度高い先行馬 / 🔥＝信頼できる先行馬）</div>",
             unsafe_allow_html=True,
         )
 
@@ -1107,12 +1115,15 @@ def render_tenkai_view(df: pd.DataFrame):
             else:
                 waku_badge = ""
 
-            # 信頼できる（脚質が安定した）逃げ・先行馬には馬名の横にアイコンを付ける
-            is_reliable = (
-                pace is not None
-                and str(row.get('馬番', '')).strip() in pace['reliable_umaban']
-            )
-            reliable_icon = f" {RELIABLE_ICON_HTML}" if is_reliable else ""
+            # 信頼できる（脚質が安定した）逃げ・先行馬には馬名の横にアイコンを付ける。
+            # 脚質安定性が「安定」なら🔥🔥、「やや不安定」なら🔥で強弱を付ける。
+            reliable_icon = ""
+            if pace is not None and str(row.get('馬番', '')).strip() in pace['reliable_umaban']:
+                icon_stability = compute_style_stability(row)
+                if icon_stability['label'] == '安定':
+                    reliable_icon = f" {RELIABLE_ICON_STRONG_HTML}"
+                elif icon_stability['label'] == 'やや不安定':
+                    reliable_icon = f" {RELIABLE_ICON_WEAK_HTML}"
 
             analysis_html = build_card_analysis_html(row) if has_style_data else ""
 
