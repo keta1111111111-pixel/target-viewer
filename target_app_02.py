@@ -1023,6 +1023,11 @@ RACE_SELECTOR_MOBILE_CSS = """
 <style>
 @media (max-width: 640px) {
     div[data-testid="stHorizontalBlock"] {
+        /* Streamlitはスマホ幅でこのブロックを flex-direction: column に
+           切り替えて縦積みにする（前回はflex-wrapしか上書きしておらず、
+           この行が無かったため効果が無かった）。rowに戻した上で
+           折り返しグリッドにする。 */
+        flex-direction: row !important;
         flex-wrap: wrap !important;
         gap: 4px !important;
     }
